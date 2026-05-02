@@ -42,8 +42,10 @@ const NAME: &str = "name";
 const LSH: &str = "lsh";
 /// HDF5 source-run accuracy estimate dataset name.
 const ACCURACY: &str = "instrument accuracy est.";
-/// Name of the single compressed MGF output document.
-const OUTPUT_MGF: &str = "GeMS_A10.mgf.zst";
+/// Prefix for compressed MGF part filenames.
+const OUTPUT_MGF_PART_PREFIX: &str = "GeMS_A10.mgf.part-";
+/// Suffix for compressed MGF part filenames.
+const OUTPUT_MGF_PART_SUFFIX: &str = ".mgf.zst";
 /// Name of the conversion summary report.
 const CONVERSION_REPORT: &str = "conversion_report.csv";
 /// Name of the row-level SPLASH duplicate report.
@@ -54,17 +56,25 @@ const EXPECTED_FRAGMENT_PEAKS: usize = 128;
 const MIN_FRAGMENT_PEAKS: usize = 2;
 /// Maximum number of fragment peaks retained in each written spectrum.
 const MAX_FRAGMENT_PEAKS: usize = 100;
+/// Input rows targeted for each compressed MGF part.
+#[cfg(not(test))]
+const MGF_PART_ROWS: usize = 1_000_000;
+/// Small test part size to exercise multi-part conversion on fixtures.
+#[cfg(test)]
+const MGF_PART_ROWS: usize = 3;
 /// Number of row visits batched before updating the progress bar.
 const PROGRESS_UPDATE_ROWS: u64 = 1024;
 /// Read buffer size used for checksum generation.
 const CHECKSUM_BUFFER_BYTES: usize = 0x0010_0000;
 
-/// Manifest row for the generated MGF document.
+/// Manifest row for one generated MGF part document.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct ManifestRow {
     /// Dataset name.
     pub dataset: String,
+    /// Zero-based MGF part index.
+    pub part: usize,
     /// Relative MGF path.
     pub path: String,
     /// First HDF5 row covered by this document.
@@ -89,8 +99,8 @@ pub struct ManifestRow {
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct ConversionReport {
-    /// Manifest row for the generated document, if any rows were visited.
-    pub manifest: Option<ManifestRow>,
+    /// Manifest rows for the generated MGF parts.
+    pub manifest: Vec<ManifestRow>,
     /// First HDF5 row visited.
     pub start_row: usize,
     /// Last HDF5 row visited, if any row was visited.
@@ -116,6 +126,13 @@ pub fn finite_positive(value: f64) -> bool {
     value.is_finite() && value > 0.0
 }
 
+/// Returns the fixed number of input rows targeted for each MGF part.
+#[inline]
+#[must_use]
+pub const fn mgf_part_rows() -> usize {
+    MGF_PART_ROWS
+}
+
 /// Returns whether `value` is inside the physical m/z range accepted downstream.
 #[inline]
 #[must_use]
@@ -130,7 +147,7 @@ pub const fn valid_charge(charge: i8) -> bool {
     charge != 0
 }
 
-/// Converts the configured GeMS-A10 HDF5 file into one zstd-compressed MGF document.
+/// Converts the configured GeMS-A10 HDF5 file into zstd-compressed MGF parts.
 ///
 /// # Errors
 ///
@@ -177,11 +194,13 @@ pub fn convert_gems_a10_with_progress(
     let stop_row = config
         .limit
         .map_or(row_count, |limit| row_count.min(config.start_row + limit));
+    remove_existing_mgf_parts(&config.output_dir)?;
     let manifest_path = config.output_dir.join("manifest.csv");
     let mut manifest = Writer::from_path(&manifest_path)
         .with_context(|| format!("failed to create {}", manifest_path.display()))?;
     manifest.write_record([
         "dataset",
+        "part",
         "path",
         "start_row",
         "end_row",
@@ -193,16 +212,18 @@ pub fn convert_gems_a10_with_progress(
         "duplicates_removed",
     ])?;
 
-    let manifest_row = (stop_row > config.start_row)
-        .then(|| write_document(config, &datasets, config.start_row, stop_row, progress))
+    let manifest_rows = (stop_row > config.start_row)
+        .then(|| write_documents(config, &datasets, config.start_row, stop_row, progress))
         .transpose()?;
-    if manifest_row.is_none() {
+    let manifest_rows = manifest_rows.unwrap_or_default();
+    if manifest_rows.is_empty() {
         write_empty_duplicate_report(&config.output_dir)?;
     }
 
-    if let Some(row) = &manifest_row {
+    for row in &manifest_rows {
         manifest.serialize((
             &row.dataset,
+            row.part,
             &row.path,
             row.start_row,
             row.end_row,
@@ -213,15 +234,13 @@ pub fn convert_gems_a10_with_progress(
             row.skipped_low_peak_spectra,
             row.duplicates_removed,
         ))?;
-        manifest.flush()?;
+    }
+    manifest.flush()?;
 
-        if config.validate_output {
-            validate_output_document(
-                &config.output_dir.join(&row.path),
-                row.spectra_written,
-                progress,
-            )?;
-        }
+    if config.validate_output && !manifest_rows.is_empty() {
+        validate_output_documents(&config.output_dir, &manifest_rows, progress)?;
+    }
+    for row in &manifest_rows {
         progress.println(format!(
             "{} rows {}-{} written={} skipped={}",
             row.path, row.start_row, row.end_row, row.spectra_written, row.spectra_skipped
@@ -230,11 +249,7 @@ pub fn convert_gems_a10_with_progress(
 
     let metadata = progress.spinner("writing README and conversion reports")?;
     write_dataset_readme(&config.output_dir, &config.input_hdf5)?;
-    write_conversion_report(
-        &config.output_dir,
-        &config.input_hdf5,
-        manifest_row.as_ref(),
-    )?;
+    write_conversion_report(&config.output_dir, &config.input_hdf5, &manifest_rows)?;
     metadata.finish_with_message(format!(
         "metadata reports written | output={}",
         config.output_dir.display()
@@ -243,32 +258,33 @@ pub fn convert_gems_a10_with_progress(
     Ok(conversion_report_from_manifest(
         config.start_row,
         stop_row,
-        manifest_row,
+        manifest_rows,
     ))
 }
 
-/// Builds the public conversion report from the optional manifest row.
+/// Builds the public conversion report from manifest rows.
 fn conversion_report_from_manifest(
     start_row: usize,
     stop_row: usize,
-    manifest_row: Option<ManifestRow>,
+    manifest_rows: Vec<ManifestRow>,
 ) -> ConversionReport {
-    let spectra_written = manifest_row.as_ref().map_or(0, |row| row.spectra_written);
-    let spectra_skipped = manifest_row.as_ref().map_or(0, |row| row.spectra_skipped);
-    let skipped_invalid_precursor_mz = manifest_row
-        .as_ref()
-        .map_or(0, |row| row.skipped_invalid_precursor_mz);
-    let skipped_invalid_charge = manifest_row
-        .as_ref()
-        .map_or(0, |row| row.skipped_invalid_charge);
-    let skipped_low_peak_spectra = manifest_row
-        .as_ref()
-        .map_or(0, |row| row.skipped_low_peak_spectra);
-    let duplicates_removed = manifest_row
-        .as_ref()
-        .map_or(0, |row| row.duplicates_removed);
+    let spectra_written = manifest_rows.iter().map(|row| row.spectra_written).sum();
+    let spectra_skipped = manifest_rows.iter().map(|row| row.spectra_skipped).sum();
+    let skipped_invalid_precursor_mz = manifest_rows
+        .iter()
+        .map(|row| row.skipped_invalid_precursor_mz)
+        .sum();
+    let skipped_invalid_charge = manifest_rows
+        .iter()
+        .map(|row| row.skipped_invalid_charge)
+        .sum();
+    let skipped_low_peak_spectra = manifest_rows
+        .iter()
+        .map(|row| row.skipped_low_peak_spectra)
+        .sum();
+    let duplicates_removed = manifest_rows.iter().map(|row| row.duplicates_removed).sum();
     ConversionReport {
-        manifest: manifest_row,
+        manifest: manifest_rows,
         start_row,
         end_row: (stop_row > start_row).then_some(stop_row - 1),
         spectra_written,
@@ -321,7 +337,7 @@ Conversion policy:
 - IONMODE is omitted because GeMS-A10 does not expose polarity
 
 Files:
-- GeMS_A10.mgf.zst: compressed MGF document
+- GeMS_A10.mgf.part-*.mgf.zst: compressed MGF part documents
 - manifest.csv: row range and skipped/written counts
 - conversion_report.csv: conversion summary and duplicate counts
 - splash_duplicates.csv: row-level SPLASH duplicate report
@@ -389,12 +405,16 @@ pub fn write_sha256sums_with_progress(
 ///
 /// When `include_checksums` is true, `SHA256SUMS` is included in the required
 /// artifact list.
+///
+/// # Errors
+///
+/// Returns an error if any expected artifact file is missing.
 pub fn expected_artifact_paths(
     output_dir: &Path,
     include_checksums: bool,
 ) -> anyhow::Result<Vec<PathBuf>> {
+    let mut paths = mgf_part_paths(output_dir)?;
     let mut names = vec![
-        OUTPUT_MGF,
         "manifest.csv",
         "README.txt",
         CONVERSION_REPORT,
@@ -404,17 +424,70 @@ pub fn expected_artifact_paths(
         names.push("SHA256SUMS");
     }
 
-    let paths = names
-        .into_iter()
-        .map(|name| {
-            let path = output_dir.join(name);
-            if !path.is_file() {
-                bail!("expected artifact is missing: {}", path.display());
-            }
-            Ok(path)
-        })
-        .collect::<anyhow::Result<Vec<_>>>()?;
+    paths.extend(
+        names
+            .into_iter()
+            .map(|name| {
+                let path = output_dir.join(name);
+                if !path.is_file() {
+                    bail!("expected artifact is missing: {}", path.display());
+                }
+                Ok(path)
+            })
+            .collect::<anyhow::Result<Vec<_>>>()?,
+    );
     Ok(paths)
+}
+
+/// Builds the fixed file name for an MGF part.
+fn mgf_part_file_name(part: usize) -> String {
+    format!("{OUTPUT_MGF_PART_PREFIX}{part:05}{OUTPUT_MGF_PART_SUFFIX}")
+}
+
+/// Returns whether a filename follows the MGF part naming convention.
+fn is_mgf_part_file_name(name: &str) -> bool {
+    name.starts_with(OUTPUT_MGF_PART_PREFIX) && name.ends_with(OUTPUT_MGF_PART_SUFFIX)
+}
+
+/// Returns sorted MGF part paths already present in an output directory.
+fn mgf_part_paths(output_dir: &Path) -> anyhow::Result<Vec<PathBuf>> {
+    let paths = existing_mgf_part_paths(output_dir)?;
+    if paths.is_empty() {
+        bail!(
+            "expected at least one MGF part file in {}",
+            output_dir.display()
+        );
+    }
+    Ok(paths)
+}
+
+/// Returns sorted MGF part paths without requiring any to exist.
+fn existing_mgf_part_paths(output_dir: &Path) -> anyhow::Result<Vec<PathBuf>> {
+    let mut paths = fs::read_dir(output_dir)
+        .with_context(|| format!("failed to read {}", output_dir.display()))?
+        .map(|entry| {
+            let entry = entry?;
+            let path = entry.path();
+            let is_part = path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(is_mgf_part_file_name);
+            Ok::<Option<PathBuf>, std::io::Error>((path.is_file() && is_part).then_some(path))
+        })
+        .filter_map(Result::transpose)
+        .collect::<Result<Vec<_>, _>>()
+        .with_context(|| format!("failed to inspect {}", output_dir.display()))?;
+    paths.sort();
+    Ok(paths)
+}
+
+/// Removes generated MGF part files before starting a fresh conversion.
+fn remove_existing_mgf_parts(output_dir: &Path) -> anyhow::Result<()> {
+    for path in existing_mgf_part_paths(output_dir)? {
+        fs::remove_file(&path)
+            .with_context(|| format!("failed to remove stale MGF part {}", path.display()))?;
+    }
+    Ok(())
 }
 
 /// Open HDF5 datasets required by the conversion.
@@ -575,102 +648,234 @@ impl PreparedRecord {
     }
 }
 
-/// Writes the configured row range into the single compressed MGF document.
-fn write_document(
+/// Counts skipped rows split by skip reason.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct SkipCounts {
+    /// Rows skipped because the precursor m/z was invalid.
+    invalid_precursor_mz: usize,
+    /// Rows skipped because the precursor charge was zero.
+    invalid_charge: usize,
+    /// Rows skipped because too few valid fragment peaks remained.
+    low_peak_spectra: usize,
+    /// Rows skipped because their SPLASH was already retained.
+    duplicates_removed: usize,
+}
+
+impl SkipCounts {
+    /// Returns the total skipped row count.
+    #[inline]
+    const fn total(self) -> usize {
+        self.invalid_precursor_mz
+            + self.invalid_charge
+            + self.low_peak_spectra
+            + self.duplicates_removed
+    }
+
+    /// Adds another skip-count bundle into this one.
+    #[inline]
+    const fn add_assign(&mut self, other: Self) {
+        self.invalid_precursor_mz += other.invalid_precursor_mz;
+        self.invalid_charge += other.invalid_charge;
+        self.low_peak_spectra += other.low_peak_spectra;
+        self.duplicates_removed += other.duplicates_removed;
+    }
+}
+
+/// Mutable state shared across all MGF part writers.
+#[derive(Debug)]
+struct DocumentWriteState<'a> {
+    /// Conversion progress bar.
+    rows: &'a ProgressBar,
+    /// Batched progress increments not yet flushed to the bar.
+    pending_progress: u64,
+    /// First retained spectrum for each SPLASH.
+    seen_splashes: HashMap<String, RetainedSpectrum>,
+    /// Global row-level duplicate report.
+    duplicate_report: Writer<File>,
+    /// Number of records written by completed parts.
+    cumulative_written: usize,
+    /// Skip counts from completed parts.
+    cumulative_skipped: SkipCounts,
+}
+
+impl<'a> DocumentWriteState<'a> {
+    /// Builds shared part-writing state.
+    fn new(rows: &'a ProgressBar, duplicate_report: Writer<File>, rows_to_visit: usize) -> Self {
+        Self {
+            rows,
+            pending_progress: 0,
+            seen_splashes: HashMap::with_capacity(rows_to_visit),
+            duplicate_report,
+            cumulative_written: 0,
+            cumulative_skipped: SkipCounts::default(),
+        }
+    }
+}
+
+/// Writes the configured row range into compressed MGF part documents.
+fn write_documents(
     config: &Config,
     datasets: &Hdf5Datasets,
     start: usize,
     end: usize,
     progress: &ProgressReporter,
-) -> anyhow::Result<ManifestRow> {
-    let document_path = config.output_dir.join(OUTPUT_MGF);
-    let mut encoder = create_mgf_encoder(&document_path)?;
+) -> anyhow::Result<Vec<ManifestRow>> {
     let duplicate_report_path = config.output_dir.join(DUPLICATE_REPORT);
     let mut duplicate_report = Writer::from_path(&duplicate_report_path)
         .with_context(|| format!("failed to create {}", duplicate_report_path.display()))?;
     write_duplicate_report_header(&mut duplicate_report)?;
 
-    let mut written = 0;
-    let mut skipped_invalid_precursor_mz = 0;
-    let mut skipped_invalid_charge = 0;
-    let mut skipped_low_peak_spectra = 0;
-    let mut duplicates_removed = 0;
     let rows_to_visit = end - start;
-    let mut seen_splashes = HashMap::<String, RetainedSpectrum>::with_capacity(rows_to_visit);
     let rows = progress.row_bar(
         rows_to_visit,
         format!(
-            "converting rows {start}-{} | written=0 skipped=0 duplicates=0",
+            "converting rows {start}-{} | parts of {MGF_PART_ROWS} rows | written=0 skipped=0 duplicates=0",
             end - 1
         ),
     )?;
-    let mut pending_progress = 0;
+    let mut manifest_rows = Vec::new();
+    let mut state = DocumentWriteState::new(&rows, duplicate_report, rows_to_visit);
 
-    for chunk_start in (start..end).step_by(config.chunk_size) {
-        let chunk_end = (chunk_start + config.chunk_size).min(end);
-        rows.set_message(format!(
-            "reading chunk {chunk_start}-{} | written={written} skipped={} duplicates={duplicates_removed}",
-            chunk_end - 1,
-                skipped_invalid_precursor_mz
-                    + skipped_invalid_charge
-                    + skipped_low_peak_spectra
-                    + duplicates_removed
-        ));
-        let chunk = read_chunk(datasets, chunk_start, chunk_end)?;
-        for offset in 0..(chunk_end - chunk_start) {
-            let precursor_mz = array_value(&chunk.precursor_mz, offset, PRECURSOR_MZ)?;
-            if !valid_mz(precursor_mz) {
-                skipped_invalid_precursor_mz += 1;
-                advance_progress(&rows, &mut pending_progress);
-                continue;
-            }
-            let charge = array_value(&chunk.charge, offset, CHARGE)?;
-            if !valid_charge(charge) {
-                skipped_invalid_charge += 1;
-                advance_progress(&rows, &mut pending_progress);
-                continue;
-            }
-
-            let row = chunk_start + offset;
-            let Some(prepared) = prepare_record(&chunk, offset, row, precursor_mz, charge)? else {
-                skipped_low_peak_spectra += 1;
-                advance_progress(&rows, &mut pending_progress);
-                continue;
-            };
-            write_prepared_record(
-                prepared,
-                &mut seen_splashes,
-                &mut duplicate_report,
-                &mut encoder,
-                &mut written,
-                &mut duplicates_removed,
-            )?;
-            advance_progress(&rows, &mut pending_progress);
-        }
+    for (part, part_start) in (start..end).step_by(MGF_PART_ROWS).enumerate() {
+        let part_end = (part_start + MGF_PART_ROWS).min(end);
+        manifest_rows.push(write_document_part(
+            config, datasets, part, part_start, part_end, &mut state,
+        )?);
     }
-    flush_progress(&rows, &mut pending_progress);
+    flush_progress(state.rows, &mut state.pending_progress);
+
+    state.duplicate_report.flush()?;
+    let spectra_skipped = state.cumulative_skipped.total();
+    state.rows.finish_with_message(format!(
+        "conversion complete | rows={rows_to_visit} parts={} written={} skipped={spectra_skipped} duplicates={}",
+        manifest_rows.len(),
+        state.cumulative_written,
+        state.cumulative_skipped.duplicates_removed,
+    ));
+    Ok(manifest_rows)
+}
+
+/// Writes one compressed MGF part and updates global deduplication state.
+fn write_document_part(
+    config: &Config,
+    datasets: &Hdf5Datasets,
+    part: usize,
+    part_start: usize,
+    part_end: usize,
+    state: &mut DocumentWriteState<'_>,
+) -> anyhow::Result<ManifestRow> {
+    let part_name = mgf_part_file_name(part);
+    let part_path = config.output_dir.join(&part_name);
+    let mut encoder = create_mgf_encoder(&part_path)?;
+    let mut written = 0usize;
+    let mut skipped = SkipCounts::default();
+
+    for chunk_start in (part_start..part_end).step_by(config.chunk_size) {
+        let chunk_end = (chunk_start + config.chunk_size).min(part_end);
+        set_conversion_progress_message(state, part, chunk_start, chunk_end, written, skipped);
+        let chunk = read_chunk(datasets, chunk_start, chunk_end)?;
+        write_chunk_rows(
+            &chunk,
+            chunk_start,
+            chunk_end,
+            &mut encoder,
+            &mut written,
+            &mut skipped,
+            state,
+        )?;
+    }
 
     encoder.finish()?;
-    duplicate_report.flush()?;
-    let spectra_skipped = skipped_invalid_precursor_mz
-        + skipped_invalid_charge
-        + skipped_low_peak_spectra
-        + duplicates_removed;
-    rows.finish_with_message(format!(
-        "conversion complete | rows={rows_to_visit} written={written} skipped={spectra_skipped} duplicates={duplicates_removed}"
-    ));
+    state.cumulative_written += written;
+    state.cumulative_skipped.add_assign(skipped);
     Ok(ManifestRow {
         dataset: DATASET_NAME.to_owned(),
-        path: OUTPUT_MGF.to_owned(),
-        start_row: start,
-        end_row: end - 1,
+        part,
+        path: part_name,
+        start_row: part_start,
+        end_row: part_end - 1,
         spectra_written: written,
-        spectra_skipped,
-        skipped_invalid_precursor_mz,
-        skipped_invalid_charge,
-        skipped_low_peak_spectra,
-        duplicates_removed,
+        spectra_skipped: skipped.total(),
+        skipped_invalid_precursor_mz: skipped.invalid_precursor_mz,
+        skipped_invalid_charge: skipped.invalid_charge,
+        skipped_low_peak_spectra: skipped.low_peak_spectra,
+        duplicates_removed: skipped.duplicates_removed,
     })
+}
+
+/// Updates the conversion progress bar for the chunk being read.
+fn set_conversion_progress_message(
+    state: &DocumentWriteState<'_>,
+    part: usize,
+    chunk_start: usize,
+    chunk_end: usize,
+    written: usize,
+    skipped: SkipCounts,
+) {
+    let skipped_total = state.cumulative_skipped.total() + skipped.total();
+    state.rows.set_message(format!(
+        "part {part:05} reading chunk {chunk_start}-{} | written={} skipped={skipped_total} duplicates={}",
+        chunk_end - 1,
+        state.cumulative_written + written,
+        state.cumulative_skipped.duplicates_removed + skipped.duplicates_removed
+    ));
+}
+
+/// Converts and writes every row in a loaded HDF5 chunk.
+fn write_chunk_rows<Z: Write>(
+    chunk: &Chunk,
+    chunk_start: usize,
+    chunk_end: usize,
+    encoder: &mut zstd::stream::write::Encoder<'_, Z>,
+    written: &mut usize,
+    skipped: &mut SkipCounts,
+    state: &mut DocumentWriteState<'_>,
+) -> anyhow::Result<()> {
+    for offset in 0..(chunk_end - chunk_start) {
+        write_chunk_row(chunk, chunk_start, offset, encoder, written, skipped, state)?;
+    }
+    Ok(())
+}
+
+/// Converts and writes one HDF5 row when it passes quality checks.
+fn write_chunk_row<Z: Write>(
+    chunk: &Chunk,
+    chunk_start: usize,
+    offset: usize,
+    encoder: &mut zstd::stream::write::Encoder<'_, Z>,
+    written: &mut usize,
+    skipped: &mut SkipCounts,
+    state: &mut DocumentWriteState<'_>,
+) -> anyhow::Result<()> {
+    let precursor_mz = array_value(&chunk.precursor_mz, offset, PRECURSOR_MZ)?;
+    if !valid_mz(precursor_mz) {
+        skipped.invalid_precursor_mz += 1;
+        advance_progress(state.rows, &mut state.pending_progress);
+        return Ok(());
+    }
+    let charge = array_value(&chunk.charge, offset, CHARGE)?;
+    if !valid_charge(charge) {
+        skipped.invalid_charge += 1;
+        advance_progress(state.rows, &mut state.pending_progress);
+        return Ok(());
+    }
+
+    let row = chunk_start + offset;
+    let Some(prepared) = prepare_record(chunk, offset, row, precursor_mz, charge)? else {
+        skipped.low_peak_spectra += 1;
+        advance_progress(state.rows, &mut state.pending_progress);
+        return Ok(());
+    };
+    write_prepared_record(
+        prepared,
+        &mut state.seen_splashes,
+        &mut state.duplicate_report,
+        encoder,
+        written,
+        &mut skipped.duplicates_removed,
+    )?;
+    advance_progress(state.rows, &mut state.pending_progress);
+    Ok(())
 }
 
 /// Creates the compressed MGF writer.
@@ -807,11 +1012,63 @@ fn write_duplicate_report_row<W: Write>(
     Ok(())
 }
 
+/// Aggregate counters derived from all manifest rows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ManifestTotals {
+    /// First HDF5 row visited.
+    start_row: usize,
+    /// Last HDF5 row visited.
+    end_row: usize,
+    /// Total number of HDF5 rows visited.
+    rows_visited: usize,
+    /// Total MGF records written.
+    spectra_written: usize,
+    /// Total HDF5 rows skipped.
+    spectra_skipped: usize,
+    /// Rows skipped because precursor m/z was invalid.
+    skipped_invalid_precursor_mz: usize,
+    /// Rows skipped because charge was zero.
+    skipped_invalid_charge: usize,
+    /// Rows skipped because too few peaks remained.
+    skipped_low_peak_spectra: usize,
+    /// Rows removed because their SPLASH was duplicate.
+    duplicates_removed: usize,
+}
+
+/// Aggregates manifest rows into one conversion summary.
+fn manifest_totals(manifest_rows: &[ManifestRow]) -> Option<ManifestTotals> {
+    let first_row = manifest_rows.first()?;
+    let last_row = manifest_rows.last()?;
+    Some(ManifestTotals {
+        start_row: first_row.start_row,
+        end_row: last_row.end_row,
+        rows_visited: manifest_rows
+            .iter()
+            .map(|row| row.end_row - row.start_row + 1)
+            .sum(),
+        spectra_written: manifest_rows.iter().map(|row| row.spectra_written).sum(),
+        spectra_skipped: manifest_rows.iter().map(|row| row.spectra_skipped).sum(),
+        skipped_invalid_precursor_mz: manifest_rows
+            .iter()
+            .map(|row| row.skipped_invalid_precursor_mz)
+            .sum(),
+        skipped_invalid_charge: manifest_rows
+            .iter()
+            .map(|row| row.skipped_invalid_charge)
+            .sum(),
+        skipped_low_peak_spectra: manifest_rows
+            .iter()
+            .map(|row| row.skipped_low_peak_spectra)
+            .sum(),
+        duplicates_removed: manifest_rows.iter().map(|row| row.duplicates_removed).sum(),
+    })
+}
+
 /// Writes a summary report for the conversion and deduplication run.
 fn write_conversion_report(
     output_dir: &Path,
     source_hdf5: &Path,
-    manifest: Option<&ManifestRow>,
+    manifest_rows: &[ManifestRow],
 ) -> anyhow::Result<PathBuf> {
     let report_path = output_dir.join(CONVERSION_REPORT);
     let mut writer = Writer::from_path(&report_path)
@@ -823,7 +1080,9 @@ fn write_conversion_report(
         "source_hdf5",
         &source_hdf5.display().to_string(),
     )?;
-    write_report_field(&mut writer, "output_mgf", OUTPUT_MGF)?;
+    write_report_field(&mut writer, "output_mgf", "GeMS_A10.mgf.part-*.mgf.zst")?;
+    write_report_field(&mut writer, "mgf_part_rows", &MGF_PART_ROWS.to_string())?;
+    write_report_field(&mut writer, "mgf_parts", &manifest_rows.len().to_string())?;
     write_report_field(&mut writer, "duplicate_report", DUPLICATE_REPORT)?;
     write_report_field(
         &mut writer,
@@ -835,64 +1094,78 @@ fn write_conversion_report(
         "min_fragment_peaks",
         &MIN_FRAGMENT_PEAKS.to_string(),
     )?;
-    if let Some(row) = manifest {
-        let rows_visited = row.end_row - row.start_row + 1;
-        write_report_field(&mut writer, "start_row", &row.start_row.to_string())?;
-        write_report_field(&mut writer, "end_row", &row.end_row.to_string())?;
-        write_report_field(&mut writer, "rows_visited", &rows_visited.to_string())?;
-        write_report_field(
-            &mut writer,
-            "spectra_written",
-            &row.spectra_written.to_string(),
-        )?;
-        write_report_field(
-            &mut writer,
-            "spectra_skipped",
-            &row.spectra_skipped.to_string(),
-        )?;
-        write_report_field(
-            &mut writer,
-            "skipped_invalid_precursor_mz",
-            &row.skipped_invalid_precursor_mz.to_string(),
-        )?;
-        write_report_field(
-            &mut writer,
-            "skipped_invalid_charge",
-            &row.skipped_invalid_charge.to_string(),
-        )?;
-        write_report_field(
-            &mut writer,
-            "skipped_low_peak_spectra",
-            &row.skipped_low_peak_spectra.to_string(),
-        )?;
-        write_report_field(
-            &mut writer,
-            "duplicates_removed",
-            &row.duplicates_removed.to_string(),
-        )?;
-        write_report_field(
-            &mut writer,
-            "unique_splash_count",
-            &row.spectra_written.to_string(),
-        )?;
+    if let Some(totals) = manifest_totals(manifest_rows) {
+        write_manifest_total_fields(&mut writer, totals)?;
     } else {
-        for field in [
-            "start_row",
-            "end_row",
-            "rows_visited",
-            "spectra_written",
-            "spectra_skipped",
-            "skipped_invalid_precursor_mz",
-            "skipped_invalid_charge",
-            "skipped_low_peak_spectra",
-            "duplicates_removed",
-            "unique_splash_count",
-        ] {
-            write_report_field(&mut writer, field, "0")?;
-        }
+        write_empty_manifest_total_fields(&mut writer)?;
     }
     writer.flush()?;
     Ok(report_path)
+}
+
+/// Writes non-empty manifest totals to the conversion report.
+fn write_manifest_total_fields<W: Write>(
+    writer: &mut Writer<W>,
+    totals: ManifestTotals,
+) -> anyhow::Result<()> {
+    write_report_field(writer, "start_row", &totals.start_row.to_string())?;
+    write_report_field(writer, "end_row", &totals.end_row.to_string())?;
+    write_report_field(writer, "rows_visited", &totals.rows_visited.to_string())?;
+    write_report_field(
+        writer,
+        "spectra_written",
+        &totals.spectra_written.to_string(),
+    )?;
+    write_report_field(
+        writer,
+        "spectra_skipped",
+        &totals.spectra_skipped.to_string(),
+    )?;
+    write_report_field(
+        writer,
+        "skipped_invalid_precursor_mz",
+        &totals.skipped_invalid_precursor_mz.to_string(),
+    )?;
+    write_report_field(
+        writer,
+        "skipped_invalid_charge",
+        &totals.skipped_invalid_charge.to_string(),
+    )?;
+    write_report_field(
+        writer,
+        "skipped_low_peak_spectra",
+        &totals.skipped_low_peak_spectra.to_string(),
+    )?;
+    write_report_field(
+        writer,
+        "duplicates_removed",
+        &totals.duplicates_removed.to_string(),
+    )?;
+    write_report_field(
+        writer,
+        "unique_splash_count",
+        &totals.spectra_written.to_string(),
+    )?;
+    Ok(())
+}
+
+/// Writes zero-valued manifest totals for an empty conversion range.
+fn write_empty_manifest_total_fields<W: Write>(writer: &mut Writer<W>) -> anyhow::Result<()> {
+    for field in [
+        "start_row",
+        "end_row",
+        "rows_visited",
+        "spectra_written",
+        "spectra_skipped",
+        "skipped_invalid_precursor_mz",
+        "skipped_invalid_charge",
+        "skipped_low_peak_spectra",
+        "duplicates_removed",
+        "unique_splash_count",
+    ] {
+        write_report_field(writer, field, "0")?;
+    }
+    Ok(())
 }
 
 /// Writes one key-value conversion report field.
@@ -1105,39 +1378,98 @@ fn slice_value<'a, T>(values: &'a [T], offset: usize, field: &str) -> anyhow::Re
         .with_context(|| format!("missing {field} value at chunk offset {offset}"))
 }
 
-/// Streams the written MGF document and checks the expected record count.
+/// Streams all written MGF parts and checks their record counts and SPLASH uniqueness.
+fn validate_output_documents(
+    output_dir: &Path,
+    manifest_rows: &[ManifestRow],
+    progress: &ProgressReporter,
+) -> anyhow::Result<()> {
+    let expected_records = manifest_rows
+        .iter()
+        .map(|row| row.spectra_written)
+        .sum::<usize>();
+    if expected_records == 0 {
+        for row in manifest_rows {
+            let path = output_dir.join(&row.path);
+            if !path.is_file() {
+                bail!("written MGF part is missing: {}", path.display());
+            }
+        }
+        progress.println(format!(
+            "validation complete | parsed=0 records | parts={}",
+            manifest_rows.len()
+        ))?;
+        return Ok(());
+    }
+
+    let validation = progress.row_bar(
+        expected_records,
+        format!("validating MGF parse-back | parts={}", manifest_rows.len()),
+    )?;
+    let mut seen_splashes = HashMap::<String, usize>::with_capacity(expected_records);
+    let mut pending_progress = 0;
+    let mut observed = 0usize;
+    for row in manifest_rows {
+        let path = output_dir.join(&row.path);
+        let part_observed = validate_output_document(
+            &path,
+            row.spectra_written,
+            observed,
+            &validation,
+            &mut pending_progress,
+            &mut seen_splashes,
+        )?;
+        observed += part_observed;
+    }
+    flush_progress(&validation, &mut pending_progress);
+    if observed != expected_records {
+        bail!("written MGF parts parsed to {observed} records, expected {expected_records}");
+    }
+    validation.finish_with_message(format!(
+        "validation complete | parsed={observed} records | parts={}",
+        manifest_rows.len()
+    ));
+    Ok(())
+}
+
+/// Streams one written MGF part and checks its expected record count.
 fn validate_output_document(
     path: &Path,
     expected_records: usize,
-    progress: &ProgressReporter,
-) -> anyhow::Result<()> {
-    let validation = progress.row_bar(
-        expected_records,
-        format!("validating MGF parse-back | {}", path.display()),
-    )?;
+    first_global_record_index: usize,
+    validation: &ProgressBar,
+    pending_progress: &mut u64,
+    seen_splashes: &mut HashMap<String, usize>,
+) -> anyhow::Result<usize> {
+    if expected_records == 0 {
+        if !path.is_file() {
+            bail!("written MGF part is missing: {}", path.display());
+        }
+        return Ok(0);
+    }
+
+    validation.set_message(format!("validating {}", path.display()));
     let mut records: MGFPathIter<usize, f64> = MGFIter::from_path(path)
         .with_context(|| format!("failed to open written MGF document {}", path.display()))?;
-    let mut seen_splashes = HashMap::<String, usize>::with_capacity(expected_records);
-    let mut pending_progress = 0;
     let observed = records.try_fold(0usize, |count, record| {
         let record = record
             .with_context(|| format!("failed to parse written MGF document {}", path.display()))?;
-        validate_parsed_record(&record, path, count, &mut seen_splashes)?;
-        advance_progress(&validation, &mut pending_progress);
+        validate_parsed_record(
+            &record,
+            path,
+            first_global_record_index + count,
+            seen_splashes,
+        )?;
+        advance_progress(validation, pending_progress);
         Ok::<usize, anyhow::Error>(count + 1)
     })?;
-    flush_progress(&validation, &mut pending_progress);
     if observed != expected_records {
         bail!(
-            "written MGF document {} parsed to {observed} records, expected {expected_records}",
+            "written MGF part {} parsed to {observed} records, expected {expected_records}",
             path.display()
         );
     }
-    validation.finish_with_message(format!(
-        "validation complete | parsed={observed} records | {}",
-        path.display()
-    ));
-    Ok(())
+    Ok(observed)
 }
 
 /// Validates one parsed output MGF record against the conversion policy.
@@ -1325,6 +1657,9 @@ mod tests {
             validate_output: true,
             publish_to_zenodo: false,
         };
+        fs::create_dir_all(&config.output_dir)?;
+        let stale_part = config.output_dir.join("GeMS_A10.mgf.part-99999.mgf.zst");
+        fs::write(&stale_part, b"stale")?;
 
         let report = convert_gems_a10(&config)?;
         ensure!(report.spectra_written == 1, "unexpected written count");
@@ -1342,16 +1677,20 @@ mod tests {
             "unexpected low-peak spectrum count"
         );
         ensure!(report.duplicates_removed == 1, "unexpected duplicate count");
-        ensure!(
-            report.manifest.as_ref().map(|row| (
-                row.spectra_written,
-                row.spectra_skipped,
-                row.duplicates_removed
-            )) == Some((1, 6, 1)),
-            "unexpected manifest counts"
+        let manifest_totals = report.manifest.iter().fold(
+            (0usize, 0usize, 0usize),
+            |(written, skipped, duplicates), row| {
+                (
+                    written + row.spectra_written,
+                    skipped + row.spectra_skipped,
+                    duplicates + row.duplicates_removed,
+                )
+            },
         );
+        ensure!(report.manifest.len() == 3, "unexpected MGF part count");
+        ensure!(manifest_totals == (1, 6, 1), "unexpected manifest counts");
 
-        let output_path = config.output_dir.join("GeMS_A10.mgf.zst");
+        let output_path = config.output_dir.join("GeMS_A10.mgf.part-00000.mgf.zst");
         let mut parsed: MGFPathIter<usize, f64> = MGFIter::from_path(output_path)?;
         let first = parsed
             .next()
@@ -1377,6 +1716,7 @@ mod tests {
             config.output_dir.join("manifest.csv").exists(),
             "manifest was not written"
         );
+        ensure!(!stale_part.exists(), "stale MGF part was not removed");
         ensure!(
             config.output_dir.join("README.txt").exists(),
             "dataset README was not written"
@@ -1428,7 +1768,7 @@ mod tests {
         ensure!(report.spectra_written == 1, "unexpected written count");
         ensure!(report.spectra_skipped == 0, "unexpected skipped count");
 
-        let output_path = config.output_dir.join("GeMS_A10.mgf.zst");
+        let output_path = config.output_dir.join("GeMS_A10.mgf.part-00000.mgf.zst");
         let mut parsed: MGFPathIter<usize, f64> = MGFIter::from_path(output_path)?;
         let first = parsed
             .next()
@@ -1480,7 +1820,7 @@ mod tests {
         let report = convert_gems_a10(&config)?;
         ensure!(report.spectra_written == 1, "unexpected written count");
         ensure!(report.spectra_skipped == 0, "unexpected skipped count");
-        let manifest = report.manifest.as_ref().context("missing manifest row")?;
+        let manifest = report.manifest.first().context("missing manifest row")?;
         ensure!(manifest.start_row == 3, "unexpected start row");
         ensure!(manifest.end_row == 3, "unexpected end row");
         Ok(())
@@ -1490,7 +1830,7 @@ mod tests {
     #[test]
     fn checksums_include_document_and_metadata() -> anyhow::Result<()> {
         let temp = TempDir::new()?;
-        let document = temp.path().join("GeMS_A10.mgf.zst");
+        let document = temp.path().join("GeMS_A10.mgf.part-00000.mgf.zst");
         fs::write(&document, b"example")?;
         fs::write(temp.path().join("manifest.csv"), b"dataset,path\n")?;
         fs::write(temp.path().join("README.txt"), b"readme\n")?;
@@ -1503,7 +1843,7 @@ mod tests {
         let checksum_path = write_sha256sums(temp.path())?;
         let checksums = fs::read_to_string(checksum_path)?;
         ensure!(
-            checksums.contains("GeMS_A10.mgf.zst"),
+            checksums.contains("GeMS_A10.mgf.part-00000.mgf.zst"),
             "document checksum missing"
         );
         ensure!(
@@ -1526,7 +1866,10 @@ mod tests {
     #[test]
     fn checksums_require_all_expected_artifacts() -> anyhow::Result<()> {
         let temp = TempDir::new()?;
-        fs::write(temp.path().join("GeMS_A10.mgf.zst"), b"example")?;
+        fs::write(
+            temp.path().join("GeMS_A10.mgf.part-00000.mgf.zst"),
+            b"example",
+        )?;
         fs::write(temp.path().join("manifest.csv"), b"dataset,path\n")?;
         fs::write(temp.path().join("README.txt"), b"readme\n")?;
         fs::write(temp.path().join("conversion_report.csv"), b"field,value\n")?;
@@ -1608,7 +1951,7 @@ mod tests {
             "unexpected invalid precursor count"
         );
 
-        let output_path = config.output_dir.join("GeMS_A10.mgf.zst");
+        let output_path = config.output_dir.join("GeMS_A10.mgf.part-00000.mgf.zst");
         let mut parsed: MGFPathIter<usize, f64> = MGFIter::from_path(output_path)?;
         let first = parsed
             .next()

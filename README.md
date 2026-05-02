@@ -3,7 +3,7 @@
 [![CI](https://github.com/earth-metabolome-initiative/mass-spec-gym-mgf-conversion/actions/workflows/ci.yml/badge.svg)](https://github.com/earth-metabolome-initiative/mass-spec-gym-mgf-conversion/actions/workflows/ci.yml)
 
 Rust converter for the MassSpecGym auxiliary GeMS-A10 spectral collection. It
-turns the GeMS-A10 HDF5 file into one compressed Mascot Generic Format document
+turns the GeMS-A10 HDF5 file into compressed Mascot Generic Format documents
 and can publish the generated artifacts to Zenodo.
 
 ## Source
@@ -29,5 +29,6 @@ artifacts.
 
 ## Conversion
 
-The output is `converted/GeMS_A10/GeMS_A10.mgf.zst`. The conversion filters
-invalid spectra, caps each spectrum to 100 peaks, and removes SPLASH duplicates.
+The output is `converted/GeMS_A10/GeMS_A10.mgf.part-*.mgf.zst`, with 1,000,000
+input rows per part. The conversion filters invalid spectra, caps each spectrum
+to 100 peaks, and removes SPLASH duplicates.

@@ -12,7 +12,8 @@ mod publication;
 pub use config::Config;
 pub use conversion::{
     ConversionReport, ManifestRow, convert_gems_a10, convert_gems_a10_with_progress,
-    finite_positive, write_dataset_readme, write_sha256sums, write_sha256sums_with_progress,
+    expected_artifact_paths, finite_positive, mgf_part_rows, write_dataset_readme,
+    write_sha256sums, write_sha256sums_with_progress,
 };
 pub use progress::ProgressReporter;
-pub use publication::publish_to_zenodo;
+pub use publication::{publish_to_zenodo, publish_to_zenodo_with_progress};
