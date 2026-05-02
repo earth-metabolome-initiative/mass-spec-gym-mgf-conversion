@@ -18,7 +18,7 @@ use mascot_rs::mascot_generic_format::MGFPathIter;
 use mascot_rs::prelude::{
     IonMode, MGFIter, MascotGenericFormat, MascotGenericFormatMetadata, Spectrum, SpectrumAlloc,
 };
-use mass_spectrometry::prelude::{ELECTRON_MASS, MAX_MZ, splash_from_peaks};
+use mass_spectrometry::prelude::{ELECTRON_MASS, MAX_MZ, SpectrumSplash};
 use ndarray::{Array1, Array3, s};
 use sha2::{Digest, Sha256};
 
@@ -54,6 +54,8 @@ const EXPECTED_FRAGMENT_PEAKS: usize = 128;
 const MIN_FRAGMENT_PEAKS: usize = 2;
 /// Maximum number of fragment peaks retained in each written spectrum.
 const MAX_FRAGMENT_PEAKS: usize = 100;
+/// Number of row visits batched before updating the progress bar.
+const PROGRESS_UPDATE_ROWS: u64 = 1024;
 /// Read buffer size used for checksum generation.
 const CHECKSUM_BUFFER_BYTES: usize = 0x0010_0000;
 
@@ -108,18 +110,21 @@ pub struct ConversionReport {
 }
 
 /// Returns whether `value` is finite and strictly positive.
+#[inline]
 #[must_use]
 pub fn finite_positive(value: f64) -> bool {
     value.is_finite() && value > 0.0
 }
 
 /// Returns whether `value` is inside the physical m/z range accepted downstream.
+#[inline]
 #[must_use]
 pub fn valid_mz(value: f64) -> bool {
     value.is_finite() && (ELECTRON_MASS..=MAX_MZ).contains(&value)
 }
 
 /// Returns whether `charge` is usable as a precursor charge.
+#[inline]
 #[must_use]
 pub const fn valid_charge(charge: i8) -> bool {
     charge != 0
@@ -532,17 +537,42 @@ struct SpectrumReportInfo {
     peak_count: usize,
 }
 
-/// Fully prepared MGF record and its deduplication metadata.
+/// MGF record prepared for SPLASH deduplication.
 #[derive(Debug)]
 struct PreparedRecord {
-    /// MGF record ready to write.
+    /// MGF record produced by `mascot-rs`.
     record: MascotGenericFormat<u32, f64>,
     /// SPLASH code computed from filtered fragment peaks.
     splash: String,
-    /// Summary retained if this is the first row with `splash`.
-    retained: RetainedSpectrum,
-    /// Row-level information used if this row is a duplicate.
+    /// Row-level information for reports and final metadata.
     report: SpectrumReportInfo,
+}
+
+impl PreparedRecord {
+    /// Builds the retained-spectrum summary for this row.
+    #[inline]
+    const fn retained(&self) -> RetainedSpectrum {
+        RetainedSpectrum {
+            row: self.report.row,
+            precursor_mz: self.report.precursor_mz,
+            charge: self.report.charge,
+            retention_time: self.report.retention_time,
+            peak_count: self.report.peak_count,
+        }
+    }
+
+    /// Adds GeMS-specific metadata before writing a unique record.
+    fn add_output_metadata(&mut self) {
+        let metadata = self.record.metadata_mut();
+        metadata.insert_arbitrary_metadata("GEMS_DATASET", DATASET_NAME);
+        metadata.insert_arbitrary_metadata("GEMS_ROW_INDEX", self.report.row.to_string());
+        metadata.insert_arbitrary_metadata("GEMS_LSH", &self.report.lsh);
+        if let Some(accuracy) = self.report.accuracy {
+            metadata
+                .insert_arbitrary_metadata("GEMS_INSTRUMENT_ACCURACY_EST", format_float(accuracy));
+        }
+        metadata.insert_arbitrary_metadata("SPLASH", &self.splash);
+    }
 }
 
 /// Writes the configured row range into the single compressed MGF document.
@@ -554,15 +584,7 @@ fn write_document(
     progress: &ProgressReporter,
 ) -> anyhow::Result<ManifestRow> {
     let document_path = config.output_dir.join(OUTPUT_MGF);
-    let file = File::create(&document_path)
-        .with_context(|| format!("failed to create {}", document_path.display()))?;
-    let writer = BufWriter::new(file);
-    let mut encoder = zstd::stream::write::Encoder::new(writer, 3).with_context(|| {
-        format!(
-            "failed to create zstd encoder for {}",
-            document_path.display()
-        )
-    })?;
+    let mut encoder = create_mgf_encoder(&document_path)?;
     let duplicate_report_path = config.output_dir.join(DUPLICATE_REPORT);
     let mut duplicate_report = Writer::from_path(&duplicate_report_path)
         .with_context(|| format!("failed to create {}", duplicate_report_path.display()))?;
@@ -573,8 +595,8 @@ fn write_document(
     let mut skipped_invalid_charge = 0;
     let mut skipped_low_peak_spectra = 0;
     let mut duplicates_removed = 0;
-    let mut seen_splashes = HashMap::<String, RetainedSpectrum>::new();
     let rows_to_visit = end - start;
+    let mut seen_splashes = HashMap::<String, RetainedSpectrum>::with_capacity(rows_to_visit);
     let rows = progress.row_bar(
         rows_to_visit,
         format!(
@@ -582,6 +604,7 @@ fn write_document(
             end - 1
         ),
     )?;
+    let mut pending_progress = 0;
 
     for chunk_start in (start..end).step_by(config.chunk_size) {
         let chunk_end = (chunk_start + config.chunk_size).min(end);
@@ -598,42 +621,34 @@ fn write_document(
             let precursor_mz = array_value(&chunk.precursor_mz, offset, PRECURSOR_MZ)?;
             if !valid_mz(precursor_mz) {
                 skipped_invalid_precursor_mz += 1;
-                rows.inc(1);
+                advance_progress(&rows, &mut pending_progress);
                 continue;
             }
             let charge = array_value(&chunk.charge, offset, CHARGE)?;
             if !valid_charge(charge) {
                 skipped_invalid_charge += 1;
-                rows.inc(1);
+                advance_progress(&rows, &mut pending_progress);
                 continue;
             }
 
             let row = chunk_start + offset;
-            let Some(prepared) = build_record(&chunk, offset, row)? else {
+            let Some(prepared) = prepare_record(&chunk, offset, row, precursor_mz, charge)? else {
                 skipped_low_peak_spectra += 1;
-                rows.inc(1);
+                advance_progress(&rows, &mut pending_progress);
                 continue;
             };
-            match seen_splashes.entry(prepared.splash.clone()) {
-                Entry::Occupied(entry) => {
-                    write_duplicate_report_row(
-                        &mut duplicate_report,
-                        &prepared.splash,
-                        entry.get(),
-                        &prepared.report,
-                    )?;
-                    duplicates_removed += 1;
-                }
-                Entry::Vacant(entry) => {
-                    entry.insert(prepared.retained);
-                    prepared.record.write_to(&mut encoder)?;
-                    writeln!(encoder)?;
-                    written += 1;
-                }
-            }
-            rows.inc(1);
+            write_prepared_record(
+                prepared,
+                &mut seen_splashes,
+                &mut duplicate_report,
+                &mut encoder,
+                &mut written,
+                &mut duplicates_removed,
+            )?;
+            advance_progress(&rows, &mut pending_progress);
         }
     }
+    flush_progress(&rows, &mut pending_progress);
 
     encoder.finish()?;
     duplicate_report.flush()?;
@@ -658,6 +673,56 @@ fn write_document(
     })
 }
 
+/// Creates the compressed MGF writer.
+fn create_mgf_encoder(
+    document_path: &Path,
+) -> anyhow::Result<zstd::stream::write::Encoder<'static, BufWriter<File>>> {
+    let file = File::create(document_path)
+        .with_context(|| format!("failed to create {}", document_path.display()))?;
+    let writer = BufWriter::new(file);
+    let mut encoder = zstd::stream::write::Encoder::new(writer, 3).with_context(|| {
+        format!(
+            "failed to create zstd encoder for {}",
+            document_path.display()
+        )
+    })?;
+    encoder
+        .multithread(zstd_worker_count())
+        .context("failed to enable multithreaded zstd compression")?;
+    Ok(encoder)
+}
+
+/// Writes or reports a prepared MGF record after SPLASH deduplication.
+fn write_prepared_record<D: Write, Z: Write>(
+    prepared: PreparedRecord,
+    seen_splashes: &mut HashMap<String, RetainedSpectrum>,
+    duplicate_report: &mut Writer<D>,
+    encoder: &mut zstd::stream::write::Encoder<'_, Z>,
+    written: &mut usize,
+    duplicates_removed: &mut usize,
+) -> anyhow::Result<()> {
+    match seen_splashes.entry(prepared.splash.clone()) {
+        Entry::Occupied(entry) => {
+            write_duplicate_report_row(
+                duplicate_report,
+                &prepared.splash,
+                entry.get(),
+                &prepared.report,
+            )?;
+            *duplicates_removed += 1;
+        }
+        Entry::Vacant(entry) => {
+            entry.insert(prepared.retained());
+            let mut prepared = prepared;
+            prepared.add_output_metadata();
+            prepared.record.write_to(&mut *encoder)?;
+            writeln!(encoder)?;
+            *written += 1;
+        }
+    }
+    Ok(())
+}
+
 /// Writes an empty duplicate report for an empty conversion range.
 fn write_empty_duplicate_report(output_dir: &Path) -> anyhow::Result<PathBuf> {
     let duplicate_report_path = output_dir.join(DUPLICATE_REPORT);
@@ -666,6 +731,31 @@ fn write_empty_duplicate_report(output_dir: &Path) -> anyhow::Result<PathBuf> {
     write_duplicate_report_header(&mut duplicate_report)?;
     duplicate_report.flush()?;
     Ok(duplicate_report_path)
+}
+
+/// Returns the zstd compression worker count for this machine.
+fn zstd_worker_count() -> u32 {
+    let workers = std::thread::available_parallelism()
+        .map_or(1, |available| available.get().saturating_sub(1).max(1));
+    u32::try_from(workers).map_or(u32::MAX, |worker_count| worker_count)
+}
+
+/// Records one processed row and updates the progress bar in batches.
+#[inline]
+fn advance_progress(progress: &ProgressBar, pending: &mut u64) {
+    *pending += 1;
+    if *pending >= PROGRESS_UPDATE_ROWS {
+        flush_progress(progress, pending);
+    }
+}
+
+/// Flushes any pending batched progress updates.
+#[inline]
+fn flush_progress(progress: &ProgressBar, pending: &mut u64) {
+    if *pending > 0 {
+        progress.inc(*pending);
+        *pending = 0;
+    }
 }
 
 /// Writes the header for the row-level SPLASH duplicate report.
@@ -929,97 +1019,62 @@ fn decode_fixed_string(bytes: &[u8]) -> String {
     String::from_utf8_lossy(trimmed).into_owned()
 }
 
-/// Builds one MGF record from a chunk row.
-fn build_record(
+/// Prepares one MGF record for SPLASH deduplication.
+fn prepare_record(
     chunk: &Chunk,
     offset: usize,
     row: usize,
+    precursor_mz: f64,
+    charge: i8,
 ) -> anyhow::Result<Option<PreparedRecord>> {
-    let row_id = u32::try_from(row).context("row index does not fit u32 FEATURE_ID")?;
-    let charge = array_value(&chunk.charge, offset, CHARGE)?;
-    if !valid_charge(charge) {
-        bail!("row {row} has invalid zero charge");
-    }
     let retention_time = array_value(&chunk.retention_time, offset, RETENTION_TIME)?;
     let rt = finite_positive(retention_time).then_some(retention_time);
     let filename = non_empty_string(slice_value(&chunk.file_name, offset, FILE_NAME)?.clone());
     let lsh = slice_value(&chunk.lsh, offset, LSH)?.clone();
     let accuracy = array_value(&chunk.accuracy, offset, ACCURACY)?;
-    let precursor_mz = array_value(&chunk.precursor_mz, offset, PRECURSOR_MZ)?;
-    let ion_mode = None::<IonMode>;
-    let mut metadata = MascotGenericFormatMetadata::new_with_smiles_and_ion_mode(
-        Some(row_id),
-        2,
-        rt,
-        charge,
-        filename.clone(),
-        None,
-        ion_mode,
-    )?
-    .with_arbitrary_metadata(vec![
-        ("GEMS_DATASET".to_owned(), DATASET_NAME.to_owned()),
-        ("GEMS_ROW_INDEX".to_owned(), row.to_string()),
-        ("GEMS_LSH".to_owned(), lsh.clone()),
-    ]);
-
-    if accuracy.is_finite() {
-        metadata.insert_arbitrary_metadata("GEMS_INSTRUMENT_ACCURACY_EST", format_float(accuracy));
-    }
-
-    let mut mzs = Vec::new();
-    let mut intensities = Vec::new();
+    let row_id = u32::try_from(row).context("HDF5 row index does not fit u32")?;
     let peak_count = chunk
         .spectra
         .shape()
         .get(2)
         .copied()
         .context("spectrum chunk is missing peak dimension")?;
-    for peak_index in 0..peak_count {
-        let mz = chunk
-            .spectra
-            .get((offset, 0, peak_index))
-            .copied()
-            .with_context(|| {
-                format!("missing fragment m/z at row offset {offset}, peak {peak_index}")
-            })?;
-        let intensity = chunk
-            .spectra
-            .get((offset, 1, peak_index))
-            .copied()
-            .with_context(|| {
-                format!("missing fragment intensity at row offset {offset}, peak {peak_index}")
-            })?;
-        if valid_mz(mz) && finite_positive(intensity) {
-            mzs.push(mz);
-            intensities.push(intensity);
+    let mz_values = chunk.spectra.slice(s![offset, 0usize, ..]);
+    let intensity_values = chunk.spectra.slice(s![offset, 1usize, ..]);
+    let mut mzs = Vec::with_capacity(peak_count);
+    let mut intensities = Vec::with_capacity(peak_count);
+    for (mz, intensity) in mz_values.iter().zip(intensity_values.iter()) {
+        if valid_mz(*mz) && finite_positive(*intensity) {
+            mzs.push(*mz);
+            intensities.push(*intensity);
         }
     }
     if mzs.is_empty() {
         return Ok(None);
     }
 
-    let mut record = MascotGenericFormat::new(metadata, precursor_mz, mzs, intensities)?
+    let metadata = MascotGenericFormatMetadata::<u32>::new_with_smiles_and_ion_mode(
+        Some(row_id),
+        2,
+        rt,
+        charge,
+        filename.clone(),
+        None,
+        None::<IonMode>,
+    )?;
+    let spectrum = MascotGenericFormat::new(metadata, precursor_mz, mzs, intensities)?
         .top_k_peaks(MAX_FRAGMENT_PEAKS)
         .context("failed to retain top fragment peaks")?;
-    let retained_peak_count = record.len();
+    let retained_peak_count = spectrum.len();
     if retained_peak_count < MIN_FRAGMENT_PEAKS {
         return Ok(None);
     }
-    let splash = splash_from_peaks(record.peaks()).context("failed to compute SPLASH")?;
-    record
-        .metadata_mut()
-        .insert_arbitrary_metadata("SPLASH", splash.clone());
+
+    let splash = spectrum.splash().context("failed to compute SPLASH")?;
     let accuracy = accuracy.is_finite().then_some(accuracy);
     Ok(Some(PreparedRecord {
-        record,
+        record: spectrum,
         splash,
-        retained: RetainedSpectrum {
-            row,
-            precursor_mz,
-            charge,
-            retention_time: rt,
-            peak_count: retained_peak_count,
-        },
         report: SpectrumReportInfo {
             row,
             precursor_mz,
@@ -1034,6 +1089,7 @@ fn build_record(
 }
 
 /// Returns a copied array value with contextual bounds errors.
+#[inline]
 fn array_value<T: Copy>(values: &Array1<T>, offset: usize, field: &str) -> anyhow::Result<T> {
     values
         .get(offset)
@@ -1042,6 +1098,7 @@ fn array_value<T: Copy>(values: &Array1<T>, offset: usize, field: &str) -> anyho
 }
 
 /// Returns a slice value with contextual bounds errors.
+#[inline]
 fn slice_value<'a, T>(values: &'a [T], offset: usize, field: &str) -> anyhow::Result<&'a T> {
     values
         .get(offset)
@@ -1060,14 +1117,16 @@ fn validate_output_document(
     )?;
     let mut records: MGFPathIter<usize, f64> = MGFIter::from_path(path)
         .with_context(|| format!("failed to open written MGF document {}", path.display()))?;
-    let mut seen_splashes = HashMap::<String, usize>::new();
+    let mut seen_splashes = HashMap::<String, usize>::with_capacity(expected_records);
+    let mut pending_progress = 0;
     let observed = records.try_fold(0usize, |count, record| {
         let record = record
             .with_context(|| format!("failed to parse written MGF document {}", path.display()))?;
         validate_parsed_record(&record, path, count, &mut seen_splashes)?;
-        validation.inc(1);
+        advance_progress(&validation, &mut pending_progress);
         Ok::<usize, anyhow::Error>(count + 1)
     })?;
+    flush_progress(&validation, &mut pending_progress);
     if observed != expected_records {
         bail!(
             "written MGF document {} parsed to {observed} records, expected {expected_records}",
@@ -1159,8 +1218,9 @@ fn validate_parsed_record(
         .metadata()
         .arbitrary_metadata_value("SPLASH")
         .with_context(|| format!("record {record_index} in {} has no SPLASH", path.display()))?;
-    let computed_splash =
-        splash_from_peaks(record.peaks()).context("failed to recompute parsed SPLASH")?;
+    let computed_splash = record
+        .splash()
+        .context("failed to recompute parsed SPLASH")?;
     if observed_splash != computed_splash {
         bail!(
             "record {record_index} in {} has SPLASH={observed_splash}, recomputed {computed_splash}",
@@ -1219,6 +1279,7 @@ fn format_digest_hex(bytes: &[u8]) -> anyhow::Result<String> {
 }
 
 /// Converts an empty string into `None`.
+#[inline]
 fn non_empty_string(value: String) -> Option<String> {
     (!value.is_empty()).then_some(value)
 }

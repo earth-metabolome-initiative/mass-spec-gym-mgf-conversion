@@ -23,7 +23,7 @@ ndarray = "0.17.2"
 sha2 = "0.11.0"
 tokio = { version = "1.52.1", features = ["macros", "rt-multi-thread"] }
 zenodo-rs = "0.1.6"
-zstd = "0.13.3"
+zstd = { version = "0.13.3", features = ["zstdmt"] }
 
 [dev-dependencies]
 tempfile = "3.27.0"
