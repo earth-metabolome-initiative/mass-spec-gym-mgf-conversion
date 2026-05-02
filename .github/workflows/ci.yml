@@ -1,0 +1,45 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTDOCFLAGS: -D warnings
+
+jobs:
+  rust:
+    name: Rust
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libhdf5-dev pkg-config
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Cache Cargo artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Check
+        run: cargo check --all-features
+
+      - name: Check formatting
+        run: cargo fmt --all --check
+
+      - name: Build docs
+        run: cargo doc --no-deps --all-features
+
+      - name: Lint
+        run: cargo clippy --all-targets --all-features -- -D warnings
+
+      - name: Test
+        run: cargo test --all-features
