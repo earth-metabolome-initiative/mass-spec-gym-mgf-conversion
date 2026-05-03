@@ -1,7 +1,8 @@
 # mass-spec-gym-mgf-conversion
 
 [![CI](https://github.com/earth-metabolome-initiative/mass-spec-gym-mgf-conversion/actions/workflows/ci.yml/badge.svg)](https://github.com/earth-metabolome-initiative/mass-spec-gym-mgf-conversion/actions/workflows/ci.yml)
-[![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.19980668.svg)](https://doi.org/10.5281/zenodo.19980668)
+[![GeMS-A10 top-100 peaks](https://zenodo.org/badge/DOI/10.5281/zenodo.19980668.svg)](https://doi.org/10.5281/zenodo.19980668)
+[![GeMS-A10 top-60 peaks](https://zenodo.org/badge/DOI/10.5281/zenodo.20001888.svg)](https://doi.org/10.5281/zenodo.20001888)
 
 Rust converter for the MassSpecGym auxiliary GeMS-A10 spectral collection. It
 turns the GeMS-A10 HDF5 file into compressed Mascot Generic Format documents
