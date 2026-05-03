@@ -9,6 +9,8 @@ const INPUT_HDF5: &str = "data/data/GeMS_A/GeMS_A10.hdf5";
 const OUTPUT_DIR: &str = "converted/GeMS_A10";
 /// Fixed HDF5 row chunk size for the conversion.
 const CHUNK_SIZE: usize = 250_000;
+/// Default maximum number of fragment peaks retained per spectrum.
+const DEFAULT_MAX_FRAGMENT_PEAKS: usize = 60;
 
 /// Runtime configuration for the deterministic full conversion run.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -20,6 +22,8 @@ pub struct Config {
     pub output_dir: PathBuf,
     /// Number of HDF5 rows read per HDF5 chunk.
     pub chunk_size: usize,
+    /// Maximum number of highest-intensity fragment peaks retained per spectrum.
+    pub max_fragment_peaks: usize,
     /// First zero-based HDF5 row to visit.
     pub start_row: usize,
     /// Optional row limit for sample conversion.
@@ -42,6 +46,7 @@ impl Config {
             input_hdf5: PathBuf::from(INPUT_HDF5),
             output_dir: PathBuf::from(OUTPUT_DIR),
             chunk_size: CHUNK_SIZE,
+            max_fragment_peaks: DEFAULT_MAX_FRAGMENT_PEAKS,
             start_row: 0,
             limit: None,
             validate_output: true,

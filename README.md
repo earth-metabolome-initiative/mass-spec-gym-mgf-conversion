@@ -32,4 +32,4 @@ artifacts.
 
 The output is `converted/GeMS_A10/GeMS_A10.mgf.part-*.mgf.zst`, with 1,000,000
 input rows per part. The conversion filters invalid spectra, caps each spectrum
-to 100 peaks, and removes SPLASH duplicates.
+to 60 peaks, and removes SPLASH duplicates.

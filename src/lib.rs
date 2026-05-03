@@ -1,9 +1,13 @@
 //! GeMS-A10 HDF5 to MGF conversion pipeline.
 
+/// Build-time converter provenance.
+mod build_info;
 /// Runtime configuration loaded from environment variables.
 mod config;
 /// HDF5 to MGF conversion logic.
 mod conversion;
+/// Shared dataset and source metadata.
+mod metadata;
 /// Terminal progress reporting.
 mod progress;
 /// Zenodo publication support.
@@ -12,8 +16,8 @@ mod publication;
 pub use config::Config;
 pub use conversion::{
     ConversionReport, ManifestRow, convert_gems_a10, convert_gems_a10_with_progress,
-    expected_artifact_paths, finite_positive, mgf_part_rows, write_dataset_readme,
-    write_sha256sums, write_sha256sums_with_progress,
+    expected_artifact_paths, expected_configured_artifact_paths, finite_positive, mgf_part_rows,
+    write_dataset_readme, write_sha256sums, write_sha256sums_with_progress,
 };
 pub use progress::ProgressReporter;
 pub use publication::{publish_to_zenodo, publish_to_zenodo_with_progress};

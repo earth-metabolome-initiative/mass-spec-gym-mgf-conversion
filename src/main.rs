@@ -2,7 +2,7 @@
 
 use anyhow::Context;
 use mass_spec_gym_mgf_conversion::{
-    Config, ProgressReporter, convert_gems_a10_with_progress, expected_artifact_paths,
+    Config, ProgressReporter, convert_gems_a10_with_progress, expected_configured_artifact_paths,
     mgf_part_rows, publish_to_zenodo_with_progress, write_sha256sums_with_progress,
 };
 
@@ -19,11 +19,15 @@ async fn main() -> anyhow::Result<()> {
     progress.println(format!("output: {}", config.output_dir.display()))?;
     progress.println(format!("HDF5 read chunk size: {}", config.chunk_size))?;
     progress.println(format!("MGF part rows: {}", mgf_part_rows()))?;
+    progress.println(format!(
+        "maximum fragment peaks: {}",
+        config.max_fragment_peaks
+    ))?;
 
-    if expected_artifact_paths(&config.output_dir, true).is_ok() {
+    if expected_configured_artifact_paths(&config, true).is_ok() {
         progress
             .println("complete converted artifacts found; skipping conversion and checksums")?;
-    } else if expected_artifact_paths(&config.output_dir, false).is_ok() {
+    } else if expected_configured_artifact_paths(&config, false).is_ok() {
         progress.println("converted artifacts found; regenerating SHA256SUMS")?;
         let checksum_path = write_sha256sums_with_progress(&config.output_dir, &progress)
             .context("failed to write SHA256SUMS")?;

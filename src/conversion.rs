@@ -8,7 +8,7 @@ use std::io::{BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, bail};
-use csv::Writer;
+use csv::{Reader, Writer};
 use hdf5::types::{TypeDescriptor, VarLenAscii, VarLenUnicode};
 use hdf5::{Dataset, Dataspace, Datatype, File as H5File, Selection};
 use hdf5_sys::h5d::H5Dread;
@@ -22,10 +22,14 @@ use mass_spectrometry::prelude::{ELECTRON_MASS, MAX_MZ, SpectrumSplash};
 use ndarray::{Array1, Array3, s};
 use sha2::{Digest, Sha256};
 
-use crate::{Config, ProgressReporter};
+use crate::metadata::{
+    CONVERTER_REPOSITORY_URL, DATASET_NAME, SOURCE_DATASET_URL, SOURCE_DIRECT_DOWNLOAD_URL,
+    SOURCE_FILE_PATH, SOURCE_FILE_URL,
+};
+use crate::{Config, ProgressReporter, build_info};
 
-/// Dataset label written into `GeMS` metadata fields.
-const DATASET_NAME: &str = "GeMS-A10";
+/// Metadata schema version for generated sidecar reports.
+const METADATA_SCHEMA_VERSION: usize = 2;
 /// HDF5 spectrum tensor dataset name.
 const SPECTRUM: &str = "spectrum";
 /// HDF5 precursor m/z dataset name.
@@ -52,10 +56,20 @@ const CONVERSION_REPORT: &str = "conversion_report.csv";
 const DUPLICATE_REPORT: &str = "splash_duplicates.csv";
 /// Exact GeMS-A10 fragment peak capacity in the HDF5 spectrum tensor.
 const EXPECTED_FRAGMENT_PEAKS: usize = 128;
+/// Human-readable GeMS-A10 spectrum tensor shape policy.
+const EXPECTED_SPECTRUM_SHAPE: &str = "(N, 2, 128)";
 /// Minimum number of valid fragment peaks required to write a spectrum.
 const MIN_FRAGMENT_PEAKS: usize = 2;
-/// Maximum number of fragment peaks retained in each written spectrum.
-const MAX_FRAGMENT_PEAKS: usize = 100;
+/// Policy label for the SPLASH computation scope.
+const SPLASH_SCOPE: &str = "after_fragment_filtering_and_top_k";
+/// Policy label for duplicate SPLASH handling.
+const SPLASH_DUPLICATE_POLICY: &str = "first_retained_row_kept";
+/// MGF output pattern written to sidecar metadata.
+const OUTPUT_MGF_PATTERN: &str = "GeMS_A10.mgf.part-*.mgf.zst";
+/// MGF parse-back validator recorded in sidecar metadata.
+const VALIDATION_READER: &str = "mascot-rs MGFIter";
+/// Zenodo license identifier recorded in sidecar metadata.
+const OUTPUT_LICENSE: &str = "MIT";
 /// Input rows targeted for each compressed MGF part.
 #[cfg(not(test))]
 const MGF_PART_ROWS: usize = 1_000_000;
@@ -93,6 +107,10 @@ pub struct ManifestRow {
     pub skipped_low_peak_spectra: usize,
     /// Number of skipped rows removed because their SPLASH was already seen.
     pub duplicates_removed: usize,
+    /// Maximum number of fragment peaks retained in spectra written to this part.
+    pub max_fragment_peaks: usize,
+    /// Minimum number of valid fragment peaks required for spectra in this part.
+    pub min_fragment_peaks: usize,
 }
 
 /// Summary for one conversion run.
@@ -117,6 +135,10 @@ pub struct ConversionReport {
     pub skipped_low_peak_spectra: usize,
     /// Number of skipped rows removed because their SPLASH was already seen.
     pub duplicates_removed: usize,
+    /// Maximum number of fragment peaks retained in each written spectrum.
+    pub max_fragment_peaks: usize,
+    /// Minimum number of fragment peaks required after filtering and capping.
+    pub min_fragment_peaks: usize,
 }
 
 /// Returns whether `value` is finite and strictly positive.
@@ -168,9 +190,7 @@ pub fn convert_gems_a10_with_progress(
     progress: &ProgressReporter,
 ) -> anyhow::Result<ConversionReport> {
     let setup = progress.spinner("preparing output directory and HDF5 datasets")?;
-    if config.chunk_size == 0 {
-        bail!("configured chunk size must be positive");
-    }
+    validate_config(config)?;
     fs::create_dir_all(&config.output_dir)
         .with_context(|| format!("failed to create {}", config.output_dir.display()))?;
 
@@ -195,23 +215,6 @@ pub fn convert_gems_a10_with_progress(
         .limit
         .map_or(row_count, |limit| row_count.min(config.start_row + limit));
     remove_existing_mgf_parts(&config.output_dir)?;
-    let manifest_path = config.output_dir.join("manifest.csv");
-    let mut manifest = Writer::from_path(&manifest_path)
-        .with_context(|| format!("failed to create {}", manifest_path.display()))?;
-    manifest.write_record([
-        "dataset",
-        "part",
-        "path",
-        "start_row",
-        "end_row",
-        "spectra_written",
-        "spectra_skipped",
-        "skipped_invalid_precursor_mz",
-        "skipped_invalid_charge",
-        "skipped_low_peak_spectra",
-        "duplicates_removed",
-    ])?;
-
     let manifest_rows = (stop_row > config.start_row)
         .then(|| write_documents(config, &datasets, config.start_row, stop_row, progress))
         .transpose()?;
@@ -219,26 +222,15 @@ pub fn convert_gems_a10_with_progress(
     if manifest_rows.is_empty() {
         write_empty_duplicate_report(&config.output_dir)?;
     }
-
-    for row in &manifest_rows {
-        manifest.serialize((
-            &row.dataset,
-            row.part,
-            &row.path,
-            row.start_row,
-            row.end_row,
-            row.spectra_written,
-            row.spectra_skipped,
-            row.skipped_invalid_precursor_mz,
-            row.skipped_invalid_charge,
-            row.skipped_low_peak_spectra,
-            row.duplicates_removed,
-        ))?;
-    }
-    manifest.flush()?;
+    write_manifest(&config.output_dir, &manifest_rows)?;
 
     if config.validate_output && !manifest_rows.is_empty() {
-        validate_output_documents(&config.output_dir, &manifest_rows, progress)?;
+        validate_output_documents(
+            &config.output_dir,
+            &manifest_rows,
+            config.max_fragment_peaks,
+            progress,
+        )?;
     }
     for row in &manifest_rows {
         progress.println(format!(
@@ -248,8 +240,17 @@ pub fn convert_gems_a10_with_progress(
     }
 
     let metadata = progress.spinner("writing README and conversion reports")?;
-    write_dataset_readme(&config.output_dir, &config.input_hdf5)?;
-    write_conversion_report(&config.output_dir, &config.input_hdf5, &manifest_rows)?;
+    write_dataset_readme(
+        &config.output_dir,
+        &config.input_hdf5,
+        config.max_fragment_peaks,
+    )?;
+    write_conversion_report(
+        &config.output_dir,
+        &config.input_hdf5,
+        &manifest_rows,
+        config.max_fragment_peaks,
+    )?;
     metadata.finish_with_message(format!(
         "metadata reports written | output={}",
         config.output_dir.display()
@@ -259,7 +260,22 @@ pub fn convert_gems_a10_with_progress(
         config.start_row,
         stop_row,
         manifest_rows,
+        config.max_fragment_peaks,
     ))
+}
+
+/// Validates conversion configuration before opening the HDF5 input.
+fn validate_config(config: &Config) -> anyhow::Result<()> {
+    if config.chunk_size == 0 {
+        bail!("configured chunk size must be positive");
+    }
+    if config.max_fragment_peaks < MIN_FRAGMENT_PEAKS {
+        bail!(
+            "configured max fragment peaks {} is below the minimum retained peak count {MIN_FRAGMENT_PEAKS}",
+            config.max_fragment_peaks
+        );
+    }
+    Ok(())
 }
 
 /// Builds the public conversion report from manifest rows.
@@ -267,6 +283,7 @@ fn conversion_report_from_manifest(
     start_row: usize,
     stop_row: usize,
     manifest_rows: Vec<ManifestRow>,
+    max_fragment_peaks: usize,
 ) -> ConversionReport {
     let spectra_written = manifest_rows.iter().map(|row| row.spectra_written).sum();
     let spectra_skipped = manifest_rows.iter().map(|row| row.spectra_skipped).sum();
@@ -293,7 +310,51 @@ fn conversion_report_from_manifest(
         skipped_invalid_charge,
         skipped_low_peak_spectra,
         duplicates_removed,
+        max_fragment_peaks,
+        min_fragment_peaks: MIN_FRAGMENT_PEAKS,
     }
+}
+
+/// Writes the part-level manifest sidecar.
+fn write_manifest(output_dir: &Path, manifest_rows: &[ManifestRow]) -> anyhow::Result<PathBuf> {
+    let manifest_path = output_dir.join("manifest.csv");
+    let mut manifest = Writer::from_path(&manifest_path)
+        .with_context(|| format!("failed to create {}", manifest_path.display()))?;
+    manifest.write_record([
+        "dataset",
+        "part",
+        "path",
+        "start_row",
+        "end_row",
+        "spectra_written",
+        "spectra_skipped",
+        "skipped_invalid_precursor_mz",
+        "skipped_invalid_charge",
+        "skipped_low_peak_spectra",
+        "duplicates_removed",
+        "max_fragment_peaks",
+        "min_fragment_peaks",
+    ])?;
+
+    for row in manifest_rows {
+        manifest.serialize((
+            &row.dataset,
+            row.part,
+            &row.path,
+            row.start_row,
+            row.end_row,
+            row.spectra_written,
+            row.spectra_skipped,
+            row.skipped_invalid_precursor_mz,
+            row.skipped_invalid_charge,
+            row.skipped_low_peak_spectra,
+            row.duplicates_removed,
+            row.max_fragment_peaks,
+            row.min_fragment_peaks,
+        ))?;
+    }
+    manifest.flush()?;
+    Ok(manifest_path)
 }
 
 /// Writes the dataset README intended to travel with Zenodo artifacts.
@@ -301,7 +362,11 @@ fn conversion_report_from_manifest(
 /// # Errors
 ///
 /// Returns an error if the file cannot be written.
-pub fn write_dataset_readme(output_dir: &Path, source_hdf5: &Path) -> anyhow::Result<PathBuf> {
+pub fn write_dataset_readme(
+    output_dir: &Path,
+    source_hdf5: &Path,
+    max_fragment_peaks: usize,
+) -> anyhow::Result<PathBuf> {
     let readme_path = output_dir.join("README.txt");
     let source_name = source_hdf5
         .file_name()
@@ -315,12 +380,18 @@ pub fn write_dataset_readme(output_dir: &Path, source_hdf5: &Path) -> anyhow::Re
 GeMS-A10 converted to Mascot Generic Format
 
 Source HDF5: {source_name}
-Source dataset: https://huggingface.co/datasets/roman-bushuiev/GeMS
-Source file: data/GeMS_A/GeMS_A10.hdf5
+Source dataset: {SOURCE_DATASET_URL}
+Source file: {SOURCE_FILE_PATH}
+Source file page: {SOURCE_FILE_URL}
+Source direct download: {SOURCE_DIRECT_DOWNLOAD_URL}
 Conversion date: {today}
-Validator: mascot-rs via this Rust conversion crate
+Converter: mass-spec-gym-mgf-conversion {package_version}
+Converter git commit: {git_commit}
+Converter git dirty: {git_dirty}
+Validator: {VALIDATION_READER}
 
 Conversion policy:
+- input spectrum tensor must have shape {EXPECTED_SPECTRUM_SHAPE}
 - one HDF5 row maps to one MGF BEGIN IONS block when valid and SPLASH-unique
 - FEATURE_ID, SCANS, and GEMS_ROW_INDEX use the zero-based HDF5 row
 - PEPMASS comes from precursor_mz and must be within the physical m/z range
@@ -329,20 +400,24 @@ Conversion policy:
 - rows with zero charge are skipped
 - fragment peaks outside the physical m/z range or with non-positive/non-finite intensity are removed
 - rows with fewer than {MIN_FRAGMENT_PEAKS} valid fragment peaks after m/z merging are skipped
-- at most {MAX_FRAGMENT_PEAKS} highest-intensity fragment peaks are retained
+- at most {max_fragment_peaks} highest-intensity fragment peaks are retained
 - fragment intensities are not renormalized
-- SPLASH is computed from the filtered and capped fragment peaks and written as metadata
+- SPLASH is computed from the filtered and capped fragment peaks and written as metadata ({SPLASH_SCOPE})
 - rows with duplicate SPLASH values are removed after the first retained row
 - SOURCE_INSTRUMENT is not written because instrument accuracy est. is not an instrument identity
 - IONMODE is omitted because GeMS-A10 does not expose polarity
+- the source is unlabeled; no SMILES, formulae, InChIKeys, compound names, adduct assignments, or curated identities are added
 
 Files:
-- GeMS_A10.mgf.part-*.mgf.zst: compressed MGF part documents
+- {OUTPUT_MGF_PATTERN}: compressed MGF part documents
 - manifest.csv: row range and skipped/written counts
 - conversion_report.csv: conversion summary and duplicate counts
 - splash_duplicates.csv: row-level SPLASH duplicate report
 - SHA256SUMS: checksums
-"
+",
+            package_version = build_info::PACKAGE_VERSION,
+            git_commit = build_info::git_commit(),
+            git_dirty = build_info::git_dirty(),
         ),
     )
     .with_context(|| format!("failed to write {}", readme_path.display()))?;
@@ -437,6 +512,113 @@ pub fn expected_artifact_paths(
             .collect::<anyhow::Result<Vec<_>>>()?,
     );
     Ok(paths)
+}
+
+/// Returns expected artifact paths only if they match the active configuration.
+///
+/// # Errors
+///
+/// Returns an error if any expected artifact is missing or if the conversion
+/// report was generated with a different configurable conversion policy.
+pub fn expected_configured_artifact_paths(
+    config: &Config,
+    include_checksums: bool,
+) -> anyhow::Result<Vec<PathBuf>> {
+    let paths = expected_artifact_paths(&config.output_dir, include_checksums)?;
+    validate_conversion_report_matches_config(config)?;
+    Ok(paths)
+}
+
+/// Validates conversion-report fields against the active configuration.
+fn validate_conversion_report_matches_config(config: &Config) -> anyhow::Result<()> {
+    let report_path = config.output_dir.join(CONVERSION_REPORT);
+    let fields = read_conversion_report_fields(&report_path)?;
+    let metadata_schema_version =
+        report_usize_field(&fields, "metadata_schema_version", &report_path)?;
+    if metadata_schema_version != METADATA_SCHEMA_VERSION {
+        bail!(
+            "converted artifacts use metadata_schema_version={metadata_schema_version}, expected {METADATA_SCHEMA_VERSION}"
+        );
+    }
+    let max_fragment_peaks = report_usize_field(&fields, "max_fragment_peaks", &report_path)?;
+    if max_fragment_peaks != config.max_fragment_peaks {
+        bail!(
+            "converted artifacts use max_fragment_peaks={max_fragment_peaks}, configured {}",
+            config.max_fragment_peaks
+        );
+    }
+    let min_fragment_peaks = report_usize_field(&fields, "min_fragment_peaks", &report_path)?;
+    if min_fragment_peaks != MIN_FRAGMENT_PEAKS {
+        bail!(
+            "converted artifacts use min_fragment_peaks={min_fragment_peaks}, expected {MIN_FRAGMENT_PEAKS}"
+        );
+    }
+    let splash_scope = report_string_field(&fields, "splash_scope", &report_path)?;
+    if splash_scope != SPLASH_SCOPE {
+        bail!("converted artifacts use splash_scope={splash_scope}, expected {SPLASH_SCOPE}");
+    }
+    let duplicate_policy = report_string_field(&fields, "splash_duplicate_policy", &report_path)?;
+    if duplicate_policy != SPLASH_DUPLICATE_POLICY {
+        bail!(
+            "converted artifacts use splash_duplicate_policy={duplicate_policy}, expected {SPLASH_DUPLICATE_POLICY}"
+        );
+    }
+    Ok(())
+}
+
+/// Reads `conversion_report.csv` into key-value rows.
+fn read_conversion_report_fields(path: &Path) -> anyhow::Result<HashMap<String, String>> {
+    let mut reader =
+        Reader::from_path(path).with_context(|| format!("failed to read {}", path.display()))?;
+    let mut fields = HashMap::new();
+    for record in reader.records() {
+        let record = record.with_context(|| format!("failed to parse {}", path.display()))?;
+        let field = record
+            .get(0)
+            .with_context(|| format!("conversion report row in {} has no field", path.display()))?;
+        let value = record
+            .get(1)
+            .with_context(|| format!("conversion report row in {} has no value", path.display()))?;
+        fields.insert(field.to_owned(), value.to_owned());
+    }
+    Ok(fields)
+}
+
+/// Reads a numeric conversion-report field.
+fn report_usize_field(
+    fields: &HashMap<String, String>,
+    field: &str,
+    path: &Path,
+) -> anyhow::Result<usize> {
+    fields
+        .get(field)
+        .with_context(|| {
+            format!(
+                "conversion report {} is missing field {field}",
+                path.display()
+            )
+        })?
+        .parse::<usize>()
+        .with_context(|| {
+            format!(
+                "conversion report field {field} in {} is not a usize",
+                path.display()
+            )
+        })
+}
+
+/// Reads a required string conversion-report field.
+fn report_string_field<'a>(
+    fields: &'a HashMap<String, String>,
+    field: &str,
+    path: &Path,
+) -> anyhow::Result<&'a str> {
+    fields.get(field).map(String::as_str).with_context(|| {
+        format!(
+            "conversion report {} is missing field {field}",
+            path.display()
+        )
+    })
 }
 
 /// Builds the fixed file name for an MGF part.
@@ -577,6 +759,8 @@ struct Chunk {
 /// Summary for the first retained spectrum for a SPLASH.
 #[derive(Debug, Clone, PartialEq)]
 struct RetainedSpectrum {
+    /// Zero-based MGF part containing the retained row.
+    part: usize,
     /// Zero-based HDF5 row retained in the MGF document.
     row: usize,
     /// Precursor m/z for the retained spectrum.
@@ -589,9 +773,20 @@ struct RetainedSpectrum {
     peak_count: usize,
 }
 
+/// Location of one source row in the generated part sequence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RowLocation {
+    /// Zero-based MGF part containing this row.
+    part: usize,
+    /// Zero-based HDF5 row.
+    row: usize,
+}
+
 /// Report information for the current spectrum row.
 #[derive(Debug, Clone, PartialEq)]
 struct SpectrumReportInfo {
+    /// Zero-based MGF part for this row.
+    part: usize,
     /// Zero-based HDF5 row.
     row: usize,
     /// Precursor m/z.
@@ -626,6 +821,7 @@ impl PreparedRecord {
     #[inline]
     const fn retained(&self) -> RetainedSpectrum {
         RetainedSpectrum {
+            part: self.report.part,
             row: self.report.row,
             precursor_mz: self.report.precursor_mz,
             charge: self.report.charge,
@@ -692,6 +888,8 @@ struct DocumentWriteState<'a> {
     seen_splashes: HashMap<String, RetainedSpectrum>,
     /// Global row-level duplicate report.
     duplicate_report: Writer<File>,
+    /// Maximum number of highest-intensity fragment peaks retained per spectrum.
+    max_fragment_peaks: usize,
     /// Number of records written by completed parts.
     cumulative_written: usize,
     /// Skip counts from completed parts.
@@ -700,12 +898,18 @@ struct DocumentWriteState<'a> {
 
 impl<'a> DocumentWriteState<'a> {
     /// Builds shared part-writing state.
-    fn new(rows: &'a ProgressBar, duplicate_report: Writer<File>, rows_to_visit: usize) -> Self {
+    fn new(
+        rows: &'a ProgressBar,
+        duplicate_report: Writer<File>,
+        rows_to_visit: usize,
+        max_fragment_peaks: usize,
+    ) -> Self {
         Self {
             rows,
             pending_progress: 0,
             seen_splashes: HashMap::with_capacity(rows_to_visit),
             duplicate_report,
+            max_fragment_peaks,
             cumulative_written: 0,
             cumulative_skipped: SkipCounts::default(),
         }
@@ -734,7 +938,12 @@ fn write_documents(
         ),
     )?;
     let mut manifest_rows = Vec::new();
-    let mut state = DocumentWriteState::new(&rows, duplicate_report, rows_to_visit);
+    let mut state = DocumentWriteState::new(
+        &rows,
+        duplicate_report,
+        rows_to_visit,
+        config.max_fragment_peaks,
+    );
 
     for (part, part_start) in (start..end).step_by(MGF_PART_ROWS).enumerate() {
         let part_end = (part_start + MGF_PART_ROWS).min(end);
@@ -776,8 +985,8 @@ fn write_document_part(
         let chunk = read_chunk(datasets, chunk_start, chunk_end)?;
         write_chunk_rows(
             &chunk,
+            part,
             chunk_start,
-            chunk_end,
             &mut encoder,
             &mut written,
             &mut skipped,
@@ -800,6 +1009,8 @@ fn write_document_part(
         skipped_invalid_charge: skipped.invalid_charge,
         skipped_low_peak_spectra: skipped.low_peak_spectra,
         duplicates_removed: skipped.duplicates_removed,
+        max_fragment_peaks: config.max_fragment_peaks,
+        min_fragment_peaks: MIN_FRAGMENT_PEAKS,
     })
 }
 
@@ -824,15 +1035,19 @@ fn set_conversion_progress_message(
 /// Converts and writes every row in a loaded HDF5 chunk.
 fn write_chunk_rows<Z: Write>(
     chunk: &Chunk,
+    part: usize,
     chunk_start: usize,
-    chunk_end: usize,
     encoder: &mut zstd::stream::write::Encoder<'_, Z>,
     written: &mut usize,
     skipped: &mut SkipCounts,
     state: &mut DocumentWriteState<'_>,
 ) -> anyhow::Result<()> {
-    for offset in 0..(chunk_end - chunk_start) {
-        write_chunk_row(chunk, chunk_start, offset, encoder, written, skipped, state)?;
+    for offset in 0..chunk.precursor_mz.len() {
+        let location = RowLocation {
+            part,
+            row: chunk_start + offset,
+        };
+        write_chunk_row(chunk, location, offset, encoder, written, skipped, state)?;
     }
     Ok(())
 }
@@ -840,7 +1055,7 @@ fn write_chunk_rows<Z: Write>(
 /// Converts and writes one HDF5 row when it passes quality checks.
 fn write_chunk_row<Z: Write>(
     chunk: &Chunk,
-    chunk_start: usize,
+    location: RowLocation,
     offset: usize,
     encoder: &mut zstd::stream::write::Encoder<'_, Z>,
     written: &mut usize,
@@ -860,8 +1075,15 @@ fn write_chunk_row<Z: Write>(
         return Ok(());
     }
 
-    let row = chunk_start + offset;
-    let Some(prepared) = prepare_record(chunk, offset, row, precursor_mz, charge)? else {
+    let Some(prepared) = prepare_record(
+        chunk,
+        offset,
+        location,
+        precursor_mz,
+        charge,
+        state.max_fragment_peaks,
+    )?
+    else {
         skipped.low_peak_spectra += 1;
         advance_progress(state.rows, &mut state.pending_progress);
         return Ok(());
@@ -968,7 +1190,9 @@ fn write_duplicate_report_header<W: Write>(writer: &mut Writer<W>) -> anyhow::Re
     writer.write_record([
         "dataset",
         "splash",
+        "retained_part",
         "retained_row",
+        "duplicate_part",
         "duplicate_row",
         "duplicate_precursor_mz",
         "duplicate_charge",
@@ -995,7 +1219,9 @@ fn write_duplicate_report_row<W: Write>(
     writer.write_record([
         DATASET_NAME.to_owned(),
         splash.to_owned(),
+        retained.part.to_string(),
         retained.row.to_string(),
+        duplicate.part.to_string(),
         duplicate.row.to_string(),
         format_float(duplicate.precursor_mz),
         duplicate.charge.to_string(),
@@ -1069,30 +1295,71 @@ fn write_conversion_report(
     output_dir: &Path,
     source_hdf5: &Path,
     manifest_rows: &[ManifestRow],
+    max_fragment_peaks: usize,
 ) -> anyhow::Result<PathBuf> {
     let report_path = output_dir.join(CONVERSION_REPORT);
     let mut writer = Writer::from_path(&report_path)
         .with_context(|| format!("failed to create {}", report_path.display()))?;
+    let conversion_date = chrono::Utc::now().date_naive().to_string();
     writer.write_record(["field", "value"])?;
+    write_report_field(
+        &mut writer,
+        "metadata_schema_version",
+        &METADATA_SCHEMA_VERSION.to_string(),
+    )?;
     write_report_field(&mut writer, "dataset", DATASET_NAME)?;
+    write_report_field(&mut writer, "conversion_date", &conversion_date)?;
+    write_report_field(
+        &mut writer,
+        "converter_package_version",
+        build_info::PACKAGE_VERSION,
+    )?;
+    write_report_field(
+        &mut writer,
+        "converter_git_commit",
+        build_info::git_commit(),
+    )?;
+    write_report_field(&mut writer, "converter_git_dirty", build_info::git_dirty())?;
+    write_report_field(
+        &mut writer,
+        "converter_repository_url",
+        CONVERTER_REPOSITORY_URL,
+    )?;
+    write_report_field(&mut writer, "source_dataset_url", SOURCE_DATASET_URL)?;
+    write_report_field(&mut writer, "source_file_path", SOURCE_FILE_PATH)?;
+    write_report_field(&mut writer, "source_file_url", SOURCE_FILE_URL)?;
+    write_report_field(
+        &mut writer,
+        "source_direct_download_url",
+        SOURCE_DIRECT_DOWNLOAD_URL,
+    )?;
     write_report_field(
         &mut writer,
         "source_hdf5",
         &source_hdf5.display().to_string(),
     )?;
-    write_report_field(&mut writer, "output_mgf", "GeMS_A10.mgf.part-*.mgf.zst")?;
+    write_report_field(&mut writer, "hdf5_spectrum_shape", EXPECTED_SPECTRUM_SHAPE)?;
+    write_report_field(&mut writer, "output_mgf", OUTPUT_MGF_PATTERN)?;
+    write_report_field(&mut writer, "output_license", OUTPUT_LICENSE)?;
+    write_report_field(&mut writer, "validation_reader", VALIDATION_READER)?;
     write_report_field(&mut writer, "mgf_part_rows", &MGF_PART_ROWS.to_string())?;
     write_report_field(&mut writer, "mgf_parts", &manifest_rows.len().to_string())?;
     write_report_field(&mut writer, "duplicate_report", DUPLICATE_REPORT)?;
     write_report_field(
         &mut writer,
         "max_fragment_peaks",
-        &MAX_FRAGMENT_PEAKS.to_string(),
+        &max_fragment_peaks.to_string(),
     )?;
     write_report_field(
         &mut writer,
         "min_fragment_peaks",
         &MIN_FRAGMENT_PEAKS.to_string(),
+    )?;
+    write_report_field(&mut writer, "splash_scope", SPLASH_SCOPE)?;
+    write_report_field(
+        &mut writer,
+        "splash_duplicate_policy",
+        SPLASH_DUPLICATE_POLICY,
     )?;
     if let Some(totals) = manifest_totals(manifest_rows) {
         write_manifest_total_fields(&mut writer, totals)?;
@@ -1296,16 +1563,17 @@ fn decode_fixed_string(bytes: &[u8]) -> String {
 fn prepare_record(
     chunk: &Chunk,
     offset: usize,
-    row: usize,
+    location: RowLocation,
     precursor_mz: f64,
     charge: i8,
+    max_fragment_peaks: usize,
 ) -> anyhow::Result<Option<PreparedRecord>> {
     let retention_time = array_value(&chunk.retention_time, offset, RETENTION_TIME)?;
     let rt = finite_positive(retention_time).then_some(retention_time);
     let filename = non_empty_string(slice_value(&chunk.file_name, offset, FILE_NAME)?.clone());
     let lsh = slice_value(&chunk.lsh, offset, LSH)?.clone();
     let accuracy = array_value(&chunk.accuracy, offset, ACCURACY)?;
-    let row_id = u32::try_from(row).context("HDF5 row index does not fit u32")?;
+    let row_id = u32::try_from(location.row).context("HDF5 row index does not fit u32")?;
     let peak_count = chunk
         .spectra
         .shape()
@@ -1336,7 +1604,7 @@ fn prepare_record(
         None::<IonMode>,
     )?;
     let spectrum = MascotGenericFormat::new(metadata, precursor_mz, mzs, intensities)?
-        .top_k_peaks(MAX_FRAGMENT_PEAKS)
+        .top_k_peaks(max_fragment_peaks)
         .context("failed to retain top fragment peaks")?;
     let retained_peak_count = spectrum.len();
     if retained_peak_count < MIN_FRAGMENT_PEAKS {
@@ -1349,7 +1617,8 @@ fn prepare_record(
         record: spectrum,
         splash,
         report: SpectrumReportInfo {
-            row,
+            part: location.part,
+            row: location.row,
             precursor_mz,
             charge,
             retention_time: rt,
@@ -1382,6 +1651,7 @@ fn slice_value<'a, T>(values: &'a [T], offset: usize, field: &str) -> anyhow::Re
 fn validate_output_documents(
     output_dir: &Path,
     manifest_rows: &[ManifestRow],
+    max_fragment_peaks: usize,
     progress: &ProgressReporter,
 ) -> anyhow::Result<()> {
     let expected_records = manifest_rows
@@ -1418,6 +1688,7 @@ fn validate_output_documents(
             &validation,
             &mut pending_progress,
             &mut seen_splashes,
+            max_fragment_peaks,
         )?;
         observed += part_observed;
     }
@@ -1440,6 +1711,7 @@ fn validate_output_document(
     validation: &ProgressBar,
     pending_progress: &mut u64,
     seen_splashes: &mut HashMap<String, usize>,
+    max_fragment_peaks: usize,
 ) -> anyhow::Result<usize> {
     if expected_records == 0 {
         if !path.is_file() {
@@ -1459,6 +1731,7 @@ fn validate_output_document(
             path,
             first_global_record_index + count,
             seen_splashes,
+            max_fragment_peaks,
         )?;
         advance_progress(validation, pending_progress);
         Ok::<usize, anyhow::Error>(count + 1)
@@ -1478,14 +1751,15 @@ fn validate_parsed_record(
     path: &Path,
     record_index: usize,
     seen_splashes: &mut HashMap<String, usize>,
+    max_fragment_peaks: usize,
 ) -> anyhow::Result<()> {
     let peak_count = record.len();
-    if !(MIN_FRAGMENT_PEAKS..=MAX_FRAGMENT_PEAKS).contains(&peak_count) {
+    if !(MIN_FRAGMENT_PEAKS..=max_fragment_peaks).contains(&peak_count) {
         bail!(
             "record {record_index} in {} has {peak_count} peaks, expected {}..={}",
             path.display(),
             MIN_FRAGMENT_PEAKS,
-            MAX_FRAGMENT_PEAKS
+            max_fragment_peaks
         );
     }
     if record.level() != 2 {
@@ -1652,6 +1926,7 @@ mod tests {
             input_hdf5: input,
             output_dir: temp.path().join("converted"),
             chunk_size: 1,
+            max_fragment_peaks: 60,
             start_row: 0,
             limit: None,
             validate_output: true,
@@ -1662,8 +1937,23 @@ mod tests {
         fs::write(&stale_part, b"stale")?;
 
         let report = convert_gems_a10(&config)?;
+        assert_fixture_report(&report, config.max_fragment_peaks)?;
+        assert_first_fixture_record(&config)?;
+        assert_fixture_metadata_files(&config, &stale_part)?;
+        Ok(())
+    }
+
+    /// Checks aggregate conversion counts for the realistic fixture.
+    fn assert_fixture_report(
+        report: &ConversionReport,
+        max_fragment_peaks: usize,
+    ) -> anyhow::Result<()> {
         ensure!(report.spectra_written == 1, "unexpected written count");
         ensure!(report.spectra_skipped == 6, "unexpected skipped count");
+        ensure!(
+            report.max_fragment_peaks == max_fragment_peaks,
+            "unexpected reported max fragment peak count"
+        );
         ensure!(
             report.skipped_invalid_precursor_mz == 1,
             "unexpected invalid precursor count"
@@ -1689,7 +1979,11 @@ mod tests {
         );
         ensure!(report.manifest.len() == 3, "unexpected MGF part count");
         ensure!(manifest_totals == (1, 6, 1), "unexpected manifest counts");
+        Ok(())
+    }
 
+    /// Checks the first parsed fixture record metadata.
+    fn assert_first_fixture_record(config: &Config) -> anyhow::Result<()> {
         let output_path = config.output_dir.join("GeMS_A10.mgf.part-00000.mgf.zst");
         let mut parsed: MGFPathIter<usize, f64> = MGFIter::from_path(output_path)?;
         let first = parsed
@@ -1712,6 +2006,11 @@ mod tests {
                 .is_some_and(|splash| splash.starts_with("splash10-")),
             "missing SPLASH metadata"
         );
+        Ok(())
+    }
+
+    /// Checks metadata sidecars written for the realistic fixture.
+    fn assert_fixture_metadata_files(config: &Config, stale_part: &Path) -> anyhow::Result<()> {
         ensure!(
             config.output_dir.join("manifest.csv").exists(),
             "manifest was not written"
@@ -1723,11 +2022,40 @@ mod tests {
         );
         let duplicate_report = fs::read_to_string(config.output_dir.join("splash_duplicates.csv"))?;
         ensure!(
-            duplicate_report.contains(",0,3,"),
-            "duplicate report did not link retained and duplicate rows"
+            duplicate_report.contains(",0,0,1,3,"),
+            "duplicate report did not include retained and duplicate part indexes"
+        );
+        let manifest = fs::read_to_string(config.output_dir.join("manifest.csv"))?;
+        ensure!(
+            manifest.contains("max_fragment_peaks,min_fragment_peaks"),
+            "manifest did not include peak policy columns"
         );
         let conversion_report =
             fs::read_to_string(config.output_dir.join("conversion_report.csv"))?;
+        ensure!(
+            conversion_report.contains("metadata_schema_version,2"),
+            "conversion report did not include metadata schema version"
+        );
+        ensure!(
+            conversion_report.contains("converter_package_version,"),
+            "conversion report did not include converter package version"
+        );
+        ensure!(
+            conversion_report.contains("converter_git_commit,"),
+            "conversion report did not include converter git commit"
+        );
+        ensure!(
+            conversion_report.contains("hdf5_spectrum_shape,\"(N, 2, 128)\""),
+            "conversion report did not include HDF5 spectrum shape"
+        );
+        ensure!(
+            conversion_report.contains("splash_scope,after_fragment_filtering_and_top_k"),
+            "conversion report did not include SPLASH scope"
+        );
+        ensure!(
+            conversion_report.contains("splash_duplicate_policy,first_retained_row_kept"),
+            "conversion report did not include SPLASH duplicate policy"
+        );
         ensure!(
             conversion_report.contains("duplicates_removed,1"),
             "conversion report did not include duplicate count"
@@ -1744,12 +2072,26 @@ mod tests {
             conversion_report.contains("skipped_low_peak_spectra,3"),
             "conversion report did not include low-peak skipped count"
         );
+        let dataset_readme = fs::read_to_string(config.output_dir.join("README.txt"))?;
+        ensure!(
+            dataset_readme.contains("input spectrum tensor must have shape (N, 2, 128)"),
+            "dataset README did not include the HDF5 tensor policy"
+        );
+        ensure!(
+            dataset_readme
+                .contains("SPLASH is computed from the filtered and capped fragment peaks"),
+            "dataset README did not include SPLASH ordering"
+        );
+        ensure!(
+            dataset_readme.contains("no SMILES, formulae, InChIKeys"),
+            "dataset README did not state that labels are not added"
+        );
         Ok(())
     }
 
-    /// Confirms spectra with more than 100 fragments are capped through `mascot-rs`.
+    /// Confirms spectra with many fragments are capped through `mascot-rs`.
     #[test]
-    fn conversion_caps_fragment_peaks_to_top_100() -> anyhow::Result<()> {
+    fn conversion_caps_fragment_peaks_to_configured_limit() -> anyhow::Result<()> {
         let temp = TempDir::new()?;
         let input = temp.path().join("GeMS_A10.hdf5");
         write_many_peaks_fixture(&input)?;
@@ -1758,6 +2100,7 @@ mod tests {
             input_hdf5: input,
             output_dir: temp.path().join("converted"),
             chunk_size: 1,
+            max_fragment_peaks: 60,
             start_row: 0,
             limit: None,
             validate_output: true,
@@ -1775,8 +2118,16 @@ mod tests {
             .transpose()?
             .context("missing first parsed MGF")?;
         ensure!(
-            first.len() == MAX_FRAGMENT_PEAKS,
+            first.len() == config.max_fragment_peaks,
             "spectrum was not capped to the configured peak limit"
+        );
+        let observed_splash = first
+            .metadata()
+            .arbitrary_metadata_value("SPLASH")
+            .context("missing SPLASH metadata")?;
+        ensure!(
+            observed_splash == first.splash()?,
+            "SPLASH was not computed from the parsed top-k spectrum"
         );
 
         let first_mz = first
@@ -1790,7 +2141,7 @@ mod tests {
             .map(|peak| peak.0)
             .context("missing last retained peak")?;
         ensure!(
-            (first_mz - 78.0f64).abs() < f64::EPSILON,
+            (first_mz - 118.0f64).abs() < f64::EPSILON,
             "lowest retained m/z was not from the top-intensity set"
         );
         ensure!(
@@ -1811,6 +2162,7 @@ mod tests {
             input_hdf5: input,
             output_dir: temp.path().join("converted"),
             chunk_size: 2,
+            max_fragment_peaks: 60,
             start_row: 3,
             limit: Some(1),
             validate_output: true,
@@ -1881,6 +2233,78 @@ mod tests {
         Ok(())
     }
 
+    /// Confirms artifact reuse rejects outputs built with a different peak cap.
+    #[test]
+    fn configured_artifacts_reject_mismatched_peak_cap() -> anyhow::Result<()> {
+        let temp = TempDir::new()?;
+        write_minimal_artifact_set(temp.path(), 2, 100)?;
+
+        let config = Config {
+            input_hdf5: temp.path().join("missing.hdf5"),
+            output_dir: temp.path().to_path_buf(),
+            chunk_size: 1,
+            max_fragment_peaks: 60,
+            start_row: 0,
+            limit: None,
+            validate_output: false,
+            publish_to_zenodo: false,
+        };
+
+        ensure!(
+            expected_configured_artifact_paths(&config, false).is_err(),
+            "configured artifact discovery should reject a different peak cap"
+        );
+        Ok(())
+    }
+
+    /// Confirms artifact reuse rejects outputs built with stale metadata.
+    #[test]
+    fn configured_artifacts_reject_stale_metadata_schema() -> anyhow::Result<()> {
+        let temp = TempDir::new()?;
+        write_minimal_artifact_set(temp.path(), 1, 60)?;
+
+        let config = Config {
+            input_hdf5: temp.path().join("missing.hdf5"),
+            output_dir: temp.path().to_path_buf(),
+            chunk_size: 1,
+            max_fragment_peaks: 60,
+            start_row: 0,
+            limit: None,
+            validate_output: false,
+            publish_to_zenodo: false,
+        };
+
+        ensure!(
+            expected_configured_artifact_paths(&config, false).is_err(),
+            "configured artifact discovery should reject a stale metadata schema"
+        );
+        Ok(())
+    }
+
+    /// Confirms artifact reuse accepts current metadata policy fields.
+    #[test]
+    fn configured_artifacts_accept_current_metadata_policy() -> anyhow::Result<()> {
+        let temp = TempDir::new()?;
+        write_minimal_artifact_set(temp.path(), 2, 60)?;
+
+        let config = Config {
+            input_hdf5: temp.path().join("missing.hdf5"),
+            output_dir: temp.path().to_path_buf(),
+            chunk_size: 1,
+            max_fragment_peaks: 60,
+            start_row: 0,
+            limit: None,
+            validate_output: false,
+            publish_to_zenodo: false,
+        };
+
+        ensure!(
+            expected_configured_artifact_paths(&config, false).is_ok(),
+            "configured artifact discovery should accept the current metadata policy"
+        );
+        Ok(())
+    }
+
     /// Confirms direct API calls reject a zero chunk size before conversion.
     #[test]
     fn conversion_rejects_zero_chunk_size() -> anyhow::Result<()> {
@@ -1889,6 +2313,7 @@ mod tests {
             input_hdf5: temp.path().join("missing.hdf5"),
             output_dir: temp.path().join("converted"),
             chunk_size: 0,
+            max_fragment_peaks: 60,
             start_row: 0,
             limit: None,
             validate_output: false,
@@ -1898,6 +2323,28 @@ mod tests {
         ensure!(
             convert_gems_a10(&config).is_err(),
             "zero chunk size should be rejected"
+        );
+        Ok(())
+    }
+
+    /// Confirms direct API calls reject a peak cap below the minimum peak filter.
+    #[test]
+    fn conversion_rejects_too_low_peak_cap() -> anyhow::Result<()> {
+        let temp = TempDir::new()?;
+        let config = Config {
+            input_hdf5: temp.path().join("missing.hdf5"),
+            output_dir: temp.path().join("converted"),
+            chunk_size: 1,
+            max_fragment_peaks: MIN_FRAGMENT_PEAKS - 1,
+            start_row: 0,
+            limit: None,
+            validate_output: false,
+            publish_to_zenodo: false,
+        };
+
+        ensure!(
+            convert_gems_a10(&config).is_err(),
+            "peak caps below the minimum fragment peak filter should be rejected"
         );
         Ok(())
     }
@@ -1913,6 +2360,7 @@ mod tests {
             input_hdf5: input,
             output_dir: temp.path().join("converted"),
             chunk_size: 1,
+            max_fragment_peaks: 60,
             start_row: 0,
             limit: None,
             validate_output: false,
@@ -1937,6 +2385,7 @@ mod tests {
             input_hdf5: input,
             output_dir: temp.path().join("converted"),
             chunk_size: 1,
+            max_fragment_peaks: 60,
             start_row: 0,
             limit: None,
             validate_output: true,
@@ -1998,6 +2447,38 @@ mod tests {
             read_string_slice(&h5.dataset(LSH)?, 0, 2)? == vec!["abc".to_owned(), "def".to_owned()],
             "fixed UTF-8 strings were not decoded correctly"
         );
+        Ok(())
+    }
+
+    /// Writes the minimum files needed for configured artifact discovery.
+    fn write_minimal_artifact_set(
+        output_dir: &Path,
+        metadata_schema_version: usize,
+        max_fragment_peaks: usize,
+    ) -> anyhow::Result<()> {
+        fs::write(
+            output_dir.join("GeMS_A10.mgf.part-00000.mgf.zst"),
+            b"example",
+        )?;
+        fs::write(output_dir.join("manifest.csv"), b"dataset,path\n")?;
+        fs::write(output_dir.join("README.txt"), b"readme\n")?;
+        fs::write(
+            output_dir.join("splash_duplicates.csv"),
+            b"dataset,splash\n",
+        )?;
+        fs::write(
+            output_dir.join("conversion_report.csv"),
+            format!(
+                "\
+field,value
+metadata_schema_version,{metadata_schema_version}
+max_fragment_peaks,{max_fragment_peaks}
+min_fragment_peaks,{MIN_FRAGMENT_PEAKS}
+splash_scope,{SPLASH_SCOPE}
+splash_duplicate_policy,{SPLASH_DUPLICATE_POLICY}
+"
+            ),
+        )?;
         Ok(())
     }
 
@@ -2078,7 +2559,7 @@ mod tests {
         Ok(())
     }
 
-    /// Writes a one-row HDF5 fixture with more than `MAX_FRAGMENT_PEAKS` peaks.
+    /// Writes a one-row HDF5 fixture with more peaks than the configured cap.
     fn write_many_peaks_fixture(path: &Path) -> anyhow::Result<()> {
         let h5 = H5File::create(path)?;
         let peak_total = EXPECTED_FRAGMENT_PEAKS;
