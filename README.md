@@ -4,6 +4,7 @@
 [![GeMS-A10 top-100 peaks](https://zenodo.org/badge/DOI/10.5281/zenodo.19980668.svg)](https://doi.org/10.5281/zenodo.19980668)
 [![GeMS-A10 top-60 peaks](https://zenodo.org/badge/DOI/10.5281/zenodo.20001888.svg)](https://doi.org/10.5281/zenodo.20001888)
 [![GeMS-A10 top-40 peaks](https://zenodo.org/badge/DOI/10.5281/zenodo.20002962.svg)](https://doi.org/10.5281/zenodo.20002962)
+[![GeMS-A10 top-20 peaks](https://zenodo.org/badge/DOI/10.5281/zenodo.20027219.svg)](https://doi.org/10.5281/zenodo.20027219)
 
 Rust converter for the MassSpecGym auxiliary GeMS-A10 spectral collection. It
 turns the GeMS-A10 HDF5 file into compressed Mascot Generic Format documents
@@ -34,4 +35,8 @@ artifacts.
 
 The output is `converted/GeMS_A10/GeMS_A10.mgf.part-*.mgf.zst`, with 1,000,000
 input rows per part. The conversion filters invalid spectra, caps each spectrum
-to top k peaks (100, 60 and 40), and removes SPLASH duplicates.
+to top k peaks (100, 60, 40, and 20), and removes SPLASH duplicates.
+
+The top-100 dataset is the highest-fidelity archive. Top-60 is the balanced
+default for most reuse. Top-40 is a compact training-oriented version. Top-20 is
+best treated as an aggressive ablation or small-footprint screening dataset.
