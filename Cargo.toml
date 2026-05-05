@@ -17,11 +17,11 @@ dotenvy = "0.15.7"
 hdf5 = { package = "hdf5-metno", version = "0.12.4" }
 hdf5-sys = { package = "hdf5-metno-sys", version = "0.11.3" }
 indicatif = "0.18.4"
-mass_spectrometry = { git = "https://github.com/earth-metabolome-initiative/mass-spectrometry-traits", rev = "33849cf912c9d2e6d13258f01593b7261e9f3c23", default-features = false, features = ["std"] }
+mass_spectrometry = { git = "https://github.com/earth-metabolome-initiative/mass-spectrometry-traits", rev = "56805ba4ef6c29442388845faebe08669f2ad385", default-features = false, features = ["std"] }
 mascot-rs = { git = "https://github.com/LucaCappelletti94/mascot-rs" }
 ndarray = "0.17.2"
 sha2 = "0.11.0"
-tokio = { version = "1.52.1", features = ["macros", "rt-multi-thread"] }
+tokio = { version = "1.52.2", features = ["macros", "rt-multi-thread"] }
 zenodo-rs = "0.1.6"
 zstd = { version = "0.13.3", features = ["zstdmt"] }
 

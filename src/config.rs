@@ -10,7 +10,7 @@ const OUTPUT_DIR: &str = "converted/GeMS_A10";
 /// Fixed HDF5 row chunk size for the conversion.
 const CHUNK_SIZE: usize = 250_000;
 /// Default maximum number of fragment peaks retained per spectrum.
-const DEFAULT_MAX_FRAGMENT_PEAKS: usize = 20;
+const DEFAULT_MAX_FRAGMENT_PEAKS: usize = 128;
 
 /// Runtime configuration for the deterministic full conversion run.
 #[derive(Debug, Clone, PartialEq, Eq)]

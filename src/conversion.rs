@@ -17,8 +17,9 @@ use indicatif::ProgressBar;
 use mascot_rs::mascot_generic_format::MGFPathIter;
 use mascot_rs::prelude::{
     IonMode, MGFIter, MascotGenericFormat, MascotGenericFormatMetadata, Spectrum, SpectrumAlloc,
+    SpectrumSplash,
 };
-use mass_spectrometry::prelude::{ELECTRON_MASS, MAX_MZ, SpectrumSplash};
+use mass_spectrometry::prelude::{ELECTRON_MASS, MAX_MZ};
 use ndarray::{Array1, Array3, s};
 use sha2::{Digest, Sha256};
 
@@ -809,7 +810,7 @@ struct SpectrumReportInfo {
 #[derive(Debug)]
 struct PreparedRecord {
     /// MGF record produced by `mascot-rs`.
-    record: MascotGenericFormat<u32, f64>,
+    record: MascotGenericFormat<f64>,
     /// SPLASH code computed from filtered fragment peaks.
     splash: String,
     /// Row-level information for reports and final metadata.
@@ -1573,7 +1574,9 @@ fn prepare_record(
     let filename = non_empty_string(slice_value(&chunk.file_name, offset, FILE_NAME)?.clone());
     let lsh = slice_value(&chunk.lsh, offset, LSH)?.clone();
     let accuracy = array_value(&chunk.accuracy, offset, ACCURACY)?;
-    let row_id = u32::try_from(location.row).context("HDF5 row index does not fit u32")?;
+    let row_id = u32::try_from(location.row)
+        .context("HDF5 row index does not fit u32")?
+        .to_string();
     let peak_count = chunk
         .spectra
         .shape()
@@ -1594,15 +1597,16 @@ fn prepare_record(
         return Ok(None);
     }
 
-    let metadata = MascotGenericFormatMetadata::<u32>::new_with_smiles_and_ion_mode(
-        Some(row_id),
+    let metadata = MascotGenericFormatMetadata::new_with_smiles_and_ion_mode(
+        Some(row_id.clone()),
         2,
         rt,
-        charge,
+        Some(charge),
         filename.clone(),
         None,
         None::<IonMode>,
-    )?;
+    )?
+    .with_scans(Some(row_id));
     let spectrum = MascotGenericFormat::new(metadata, precursor_mz, mzs, intensities)?
         .top_k_peaks(max_fragment_peaks)
         .context("failed to retain top fragment peaks")?;
@@ -1721,7 +1725,7 @@ fn validate_output_document(
     }
 
     validation.set_message(format!("validating {}", path.display()));
-    let mut records: MGFPathIter<usize, f64> = MGFIter::from_path(path)
+    let mut records: MGFPathIter<f64> = MGFIter::from_path(path)
         .with_context(|| format!("failed to open written MGF document {}", path.display()))?;
     let observed = records.try_fold(0usize, |count, record| {
         let record = record
@@ -1747,10 +1751,37 @@ fn validate_output_document(
 
 /// Validates one parsed output MGF record against the conversion policy.
 fn validate_parsed_record(
-    record: &MascotGenericFormat<usize, f64>,
+    record: &MascotGenericFormat<f64>,
     path: &Path,
     record_index: usize,
     seen_splashes: &mut HashMap<String, usize>,
+    max_fragment_peaks: usize,
+) -> anyhow::Result<()> {
+    validate_parsed_spectrum(record, path, record_index, max_fragment_peaks)?;
+
+    let feature_id =
+        parse_required_usize_metadata(record.feature_id(), "FEATURE_ID", record_index, path)?;
+    let row_index = parse_required_usize_metadata(
+        record.metadata().arbitrary_metadata_value("GEMS_ROW_INDEX"),
+        "GEMS_ROW_INDEX",
+        record_index,
+        path,
+    )?;
+    if feature_id != row_index {
+        bail!(
+            "record {record_index} in {} has FEATURE_ID={feature_id} but GEMS_ROW_INDEX={row_index}",
+            path.display()
+        );
+    }
+
+    validate_parsed_splash(record, path, record_index, seen_splashes)
+}
+
+/// Validates one parsed spectrum's physical fields and peak count.
+fn validate_parsed_spectrum(
+    record: &MascotGenericFormat<f64>,
+    path: &Path,
+    record_index: usize,
     max_fragment_peaks: usize,
 ) -> anyhow::Result<()> {
     let peak_count = record.len();
@@ -1769,7 +1800,13 @@ fn validate_parsed_record(
             record.level()
         );
     }
-    if !valid_charge(record.charge()) {
+    let charge = record.charge().with_context(|| {
+        format!(
+            "record {record_index} in {} has no precursor charge",
+            path.display()
+        )
+    })?;
+    if !valid_charge(charge) {
         bail!(
             "record {record_index} in {} has invalid zero charge",
             path.display()
@@ -1790,39 +1827,38 @@ fn validate_parsed_record(
             );
         }
     }
+    Ok(())
+}
 
-    let feature_id = record.feature_id().with_context(|| {
-        format!(
-            "record {record_index} in {} has no FEATURE_ID",
-            path.display()
-        )
-    })?;
-    let row_index = record
-        .metadata()
-        .arbitrary_metadata_value("GEMS_ROW_INDEX")
-        .with_context(|| {
-            format!(
-                "record {record_index} in {} has no GEMS_ROW_INDEX",
-                path.display()
-            )
-        })?
+/// Parses a required unsigned integer metadata value.
+fn parse_required_usize_metadata(
+    value: Option<&str>,
+    field: &str,
+    record_index: usize,
+    path: &Path,
+) -> anyhow::Result<usize> {
+    value
+        .with_context(|| format!("record {record_index} in {} has no {field}", path.display()))?
         .parse::<usize>()
         .with_context(|| {
             format!(
-                "record {record_index} in {} has non-numeric GEMS_ROW_INDEX",
+                "record {record_index} in {} has non-numeric {field}",
                 path.display()
             )
-        })?;
-    if feature_id != row_index {
-        bail!(
-            "record {record_index} in {} has FEATURE_ID={feature_id} but GEMS_ROW_INDEX={row_index}",
-            path.display()
-        );
-    }
+        })
+}
 
+/// Validates SPLASH metadata, recomputation, and within-output uniqueness.
+fn validate_parsed_splash(
+    record: &MascotGenericFormat<f64>,
+    path: &Path,
+    record_index: usize,
+    seen_splashes: &mut HashMap<String, usize>,
+) -> anyhow::Result<()> {
     let observed_splash = record
         .metadata()
-        .arbitrary_metadata_value("SPLASH")
+        .splash()
+        .or_else(|| record.metadata().arbitrary_metadata_value("SPLASH"))
         .with_context(|| format!("record {record_index} in {} has no SPLASH", path.display()))?;
     let computed_splash = record
         .splash()
@@ -1985,12 +2021,12 @@ mod tests {
     /// Checks the first parsed fixture record metadata.
     fn assert_first_fixture_record(config: &Config) -> anyhow::Result<()> {
         let output_path = config.output_dir.join("GeMS_A10.mgf.part-00000.mgf.zst");
-        let mut parsed: MGFPathIter<usize, f64> = MGFIter::from_path(output_path)?;
+        let mut parsed: MGFPathIter<f64> = MGFIter::from_path(output_path)?;
         let first = parsed
             .next()
             .transpose()?
             .context("missing first parsed MGF")?;
-        ensure!(first.feature_id() == Some(0), "unexpected feature id");
+        ensure!(first.feature_id() == Some("0"), "unexpected feature id");
         ensure!(
             first.metadata().arbitrary_metadata_value("GEMS_ROW_INDEX") == Some("0"),
             "unexpected row index metadata"
@@ -2002,7 +2038,8 @@ mod tests {
         ensure!(
             first
                 .metadata()
-                .arbitrary_metadata_value("SPLASH")
+                .splash()
+                .or_else(|| first.metadata().arbitrary_metadata_value("SPLASH"))
                 .is_some_and(|splash| splash.starts_with("splash10-")),
             "missing SPLASH metadata"
         );
@@ -2112,7 +2149,7 @@ mod tests {
         ensure!(report.spectra_skipped == 0, "unexpected skipped count");
 
         let output_path = config.output_dir.join("GeMS_A10.mgf.part-00000.mgf.zst");
-        let mut parsed: MGFPathIter<usize, f64> = MGFIter::from_path(output_path)?;
+        let mut parsed: MGFPathIter<f64> = MGFIter::from_path(output_path)?;
         let first = parsed
             .next()
             .transpose()?
@@ -2123,7 +2160,8 @@ mod tests {
         );
         let observed_splash = first
             .metadata()
-            .arbitrary_metadata_value("SPLASH")
+            .splash()
+            .or_else(|| first.metadata().arbitrary_metadata_value("SPLASH"))
             .context("missing SPLASH metadata")?;
         ensure!(
             observed_splash == first.splash()?,
@@ -2401,7 +2439,7 @@ mod tests {
         );
 
         let output_path = config.output_dir.join("GeMS_A10.mgf.part-00000.mgf.zst");
-        let mut parsed: MGFPathIter<usize, f64> = MGFIter::from_path(output_path)?;
+        let mut parsed: MGFPathIter<f64> = MGFIter::from_path(output_path)?;
         let first = parsed
             .next()
             .transpose()?
